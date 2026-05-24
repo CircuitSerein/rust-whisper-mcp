@@ -1,0 +1,40 @@
+services:
+  whisper-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rust-whisper-mcp:latest
+    container_name: rust-whisper-mcp
+    restart: unless-stopped
+    ports:
+      - "17800:8080"
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      WHISPER_MODEL_PATH: /models/ggml-large-v3.bin
+      WHISPER_MODEL_URL: https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin
+      DATA_DIR: /data
+      BIND_ADDR: 0.0.0.0:8080
+      # Force CUDA to only see GPU index 1 (RTX 2080). Docker Desktop ignores
+      # device_ids below, so this is the actual selector.
+      CUDA_VISIBLE_DEVICES: "1"
+    volumes:
+      # Host path uses Windows form when invoked from PowerShell / Docker Desktop.
+      # Edit to match your machine if D:\whisper-data differs.
+      - "D:/whisper-data:/data"
+      - "whisper-models:/models"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]   # GPU2 (0-indexed)
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  whisper-models:

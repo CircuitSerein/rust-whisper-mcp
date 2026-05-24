@@ -1,0 +1,6 @@
+target/
+data/
+models/
+.git/
+.claude/
+*.md
