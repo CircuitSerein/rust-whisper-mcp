@@ -14,7 +14,7 @@ jobs:
     name: fmt · clippy · test · build (no CUDA)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # whisper.cpp (via whisper-rs-sys) needs cmake + a C/C++ compiler, and
       # bindgen needs libclang. CUDA is intentionally NOT installed here — the
