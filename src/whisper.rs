@@ -78,7 +78,7 @@ impl Engine {
         // Explicit "auto" triggers whisper.cpp's language detection.
         // Default (unset) is "en", which silently mis-transcribes non-English.
         params.set_language(Some(language.unwrap_or("auto")));
-        params.set_progress_callback_safe(move |p| on_progress(p));
+        params.set_progress_callback_safe(on_progress);
 
         state.full(params, pcm).context("whisper full")?;
 
