@@ -37,7 +37,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 url = "2"
 uuid = { version = "1", features = ["v4"] }
-which = "7"
 
 [features]
 # GPU build is the default (and what the Docker image uses). CI and CPU-only
