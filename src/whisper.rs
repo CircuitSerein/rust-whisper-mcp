@@ -69,7 +69,7 @@ impl Engine {
         // below as the hard backstop.
         params.set_no_context(true);
         params.set_suppress_blank(true);
-        params.set_suppress_non_speech_tokens(true);
+        params.set_suppress_nst(true);
         params.set_single_segment(false);
         params.set_temperature(0.0);
         params.set_temperature_inc(0.2);
@@ -86,13 +86,16 @@ impl Engine {
         // on unrecoverable audio, cap consecutive identical segments so the
         // output can never again become the same sentence x1180. A short repeat
         // is kept (legit "Да. Да."); the rest is dropped.
-        let n = state.full_n_segments().context("segment count")?;
+        let n = state.full_n_segments();
         const MAX_REPEAT: u32 = 3;
         let mut text = String::new();
         let mut prev = String::new();
         let mut repeat = 0u32;
         for i in 0..n {
-            if let Ok(seg) = state.full_get_segment_text(i) {
+            let Some(segment) = state.get_segment(i) else {
+                continue;
+            };
+            if let Ok(seg) = segment.to_str_lossy() {
                 let seg = seg.trim();
                 if seg.is_empty() {
                     continue;
@@ -113,11 +116,10 @@ impl Engine {
             }
         }
 
-        let language = state
-            .full_lang_id_from_state()
-            .ok()
-            .and_then(get_lang_str)
-            .map(|s| s.to_string());
+        // whisper-rs 0.16: full_lang_id_from_state returns a bare i32; get_lang_str
+        // still returns Option<&'static str> (None for an unset/invalid id), which
+        // preserves the original "None when no language detected" behaviour.
+        let language = get_lang_str(state.full_lang_id_from_state()).map(|s| s.to_string());
 
         Ok(TranscriptionOutput {
             text,
