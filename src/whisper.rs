@@ -41,20 +41,40 @@ impl Engine {
         language: Option<&str>,
         on_progress: impl Fn(i32) + Send + Sync + 'static,
     ) -> Result<TranscriptionOutput> {
-        let ctx = self.ctx.lock().map_err(|_| anyhow!("whisper mutex poisoned"))?;
+        let ctx = self
+            .ctx
+            .lock()
+            .map_err(|_| anyhow!("whisper mutex poisoned"))?;
         let mut state = ctx.create_state().context("create whisper state")?;
 
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        // best_of > 1 gives the temperature fallback real candidates to pick
+        // from when a decode is rejected as repetitive/low-confidence.
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 5 });
         params.set_n_threads(num_cpus());
         params.set_translate(false);
         params.set_print_special(false);
         params.set_print_progress(false);
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
-        // Reduce hallucinated repetition on silence/outro music.
+        // --- Anti-hallucination / anti-repetition ---
+        // Degraded-mic or near-silent audio makes whisper.cpp loop the same
+        // phrase. Layered defences:
+        //   1. no_context: don't feed prior text back in (no cross-window carry).
+        //   2. temperature fallback (temperature_inc): retry hotter when a decode
+        //      is repetitive (low entropy) or low-confidence (low logprob).
+        //   3. suppress_nst: drop non-speech tokens.
+        //   4. entropy_thold raised 2.4 -> 2.8: reject repetitive decodes harder.
+        // NOTE: no_speech_thold is a no-op in whisper.cpp (unimplemented), so
+        // silence detection can't be relied on — hence the segment-dedup guard
+        // below as the hard backstop.
         params.set_no_context(true);
         params.set_suppress_blank(true);
+        params.set_suppress_non_speech_tokens(true);
         params.set_single_segment(false);
+        params.set_temperature(0.0);
+        params.set_temperature_inc(0.2);
+        params.set_entropy_thold(2.8);
+        params.set_logprob_thold(-1.0);
         // Explicit "auto" triggers whisper.cpp's language detection.
         // Default (unset) is "en", which silently mis-transcribes non-English.
         params.set_language(Some(language.unwrap_or("auto")));
@@ -62,14 +82,34 @@ impl Engine {
 
         state.full(params, pcm).context("whisper full")?;
 
+        // Hard backstop against runaway repetition: even if whisper still loops
+        // on unrecoverable audio, cap consecutive identical segments so the
+        // output can never again become the same sentence x1180. A short repeat
+        // is kept (legit "Да. Да."); the rest is dropped.
         let n = state.full_n_segments().context("segment count")?;
+        const MAX_REPEAT: u32 = 3;
         let mut text = String::new();
+        let mut prev = String::new();
+        let mut repeat = 0u32;
         for i in 0..n {
             if let Ok(seg) = state.full_get_segment_text(i) {
+                let seg = seg.trim();
+                if seg.is_empty() {
+                    continue;
+                }
+                if seg == prev {
+                    repeat += 1;
+                    if repeat >= MAX_REPEAT {
+                        continue;
+                    }
+                } else {
+                    repeat = 0;
+                    prev = seg.to_string();
+                }
                 if !text.is_empty() {
                     text.push(' ');
                 }
-                text.push_str(seg.trim());
+                text.push_str(seg);
             }
         }
 
