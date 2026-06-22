@@ -61,11 +61,13 @@ fn default_true() -> bool {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
-    let model_path = std::env::var("WHISPER_MODEL_PATH")
-        .unwrap_or_else(|_| "/models/ggml-large-v3.bin".into());
+    let model_path =
+        std::env::var("WHISPER_MODEL_PATH").unwrap_or_else(|_| "/models/ggml-large-v3.bin".into());
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into());
     let bind = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
 
@@ -122,7 +124,12 @@ async fn api_transcribe_upload(
 ) -> Result<Json<TranscribeResult>, ApiError> {
     let res = state
         .server
-        .run_upload(body.to_vec(), q.filename.as_deref(), q.language.as_deref(), |_| {})
+        .run_upload(
+            body.to_vec(),
+            q.filename.as_deref(),
+            q.language.as_deref(),
+            |_| {},
+        )
         .await
         .map_err(ApiError::from)?;
     Ok(Json(res))

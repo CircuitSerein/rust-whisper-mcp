@@ -5,9 +5,7 @@ use std::time::Instant;
 use anyhow::{Context as _, Result};
 use rmcp::{
     handler::server::router::tool::ToolRouter,
-    model::{
-        CallToolResult, Content, ProgressNotificationParam, ServerCapabilities, ServerInfo,
-    },
+    model::{CallToolResult, Content, ProgressNotificationParam, ServerCapabilities, ServerInfo},
     schemars,
     service::RequestContext,
     tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler,
@@ -92,10 +90,11 @@ impl WhisperServer {
         let _enter = span.enter();
         tracing::info!(path, language = ?language, cleanup, "request received");
 
-        let resolved =
-            paths::resolve_in_data_dir(path, &self.data_dir).context("resolve path")?;
+        let resolved = paths::resolve_in_data_dir(path, &self.data_dir).context("resolve path")?;
 
-        let pcm = media::decode_to_pcm(&resolved).await.context("ffmpeg decode")?;
+        let pcm = media::decode_to_pcm(&resolved)
+            .await
+            .context("ffmpeg decode")?;
         let out = self
             .transcribe_pcm_async(pcm, language, on_whisper_progress)
             .await
@@ -150,7 +149,9 @@ impl WhisperServer {
             .context("create inbox dir")?;
         let path = inbox.join(format!("{id}.{ext}"));
         let size = bytes.len();
-        tokio::fs::write(&path, bytes).await.context("write upload")?;
+        tokio::fs::write(&path, bytes)
+            .await
+            .context("write upload")?;
         tracing::info!(
             path = %path.display(),
             bytes = size,
@@ -307,7 +308,9 @@ fn short_id() -> String {
 /// Build a closure that forwards whisper's 0..100 progress ticks to the
 /// MCP client as `notify_progress` calls. The mapping puts whisper into
 /// the 0.20..0.98 range of the overall task.
-fn whisper_progress_callback(ctx: &RequestContext<RoleServer>) -> impl Fn(i32) + Send + Sync + 'static {
+fn whisper_progress_callback(
+    ctx: &RequestContext<RoleServer>,
+) -> impl Fn(i32) + Send + Sync + 'static {
     let peer = ctx.peer.clone();
     let token = progress_token(ctx);
     move |p_percent| {
@@ -331,11 +334,7 @@ fn progress_token(ctx: &RequestContext<RoleServer>) -> Option<rmcp::model::Progr
     ctx.meta.get_progress_token()
 }
 
-async fn emit_progress(
-    ctx: &RequestContext<RoleServer>,
-    progress: f64,
-    message: Option<String>,
-) {
+async fn emit_progress(ctx: &RequestContext<RoleServer>, progress: f64, message: Option<String>) {
     if let Some(token) = progress_token(ctx) {
         let _ = ctx
             .peer

@@ -7,27 +7,35 @@ services:
     container_name: rust-whisper-mcp
     restart: unless-stopped
     ports:
-      - "17800:8080"
+      # Bind to the host loopback only — the /mcp and /api/transcribe/* endpoints
+      # are unauthenticated, so they must not be exposed to the LAN by default.
+      # Front it with a reverse proxy + auth before switching to 0.0.0.0.
+      - "127.0.0.1:${WHISPER_PORT:-17800}:8080"
     environment:
       RUST_LOG: ${RUST_LOG:-info}
       WHISPER_MODEL_PATH: /models/ggml-large-v3.bin
       WHISPER_MODEL_URL: https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin
       DATA_DIR: /data
       BIND_ADDR: 0.0.0.0:8080
-      # Force CUDA to only see GPU index 1 (RTX 2080). Docker Desktop ignores
-      # device_ids below, so this is the actual selector.
-      CUDA_VISIBLE_DEVICES: "1"
+      # Lets transcribe_file map host-style absolute paths
+      # (D:\whisper-data\clip.mp4 or /mnt/d/whisper-data/clip.mp4) onto /data.
+      # Mirrors the host mount root so the README's absolute-path examples work.
+      HOST_MOUNT_ROOT: ${WHISPER_DATA_DIR:-D:/whisper-data}
+      # Which physical GPU CUDA sees (0-indexed). On Docker Desktop the
+      # device_ids reservation below is ignored, so this is the real selector.
+      # Override via GPU_INDEX in .env (see .env.example).
+      CUDA_VISIBLE_DEVICES: "${GPU_INDEX:-1}"
     volumes:
-      # Host path uses Windows form when invoked from PowerShell / Docker Desktop.
-      # Edit to match your machine if D:\whisper-data differs.
-      - "D:/whisper-data:/data"
+      # Host directory dropped into the container at /data. Set WHISPER_DATA_DIR
+      # in .env (Windows/Docker Desktop wants forward slashes, e.g. D:/whisper-data).
+      - "${WHISPER_DATA_DIR:-D:/whisper-data}:/data"
       - "whisper-models:/models"
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["1"]   # GPU2 (0-indexed)
+              device_ids: ["${GPU_INDEX:-1}"]   # 0-indexed; matches CUDA_VISIBLE_DEVICES
               capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]

@@ -26,3 +26,11 @@ Thumbs.db
 *.swp
 *.log
 *.tmp
+
+# Runtime data / downloaded models (mounted as volumes in Docker)
+/data/
+/models/
+*.bin
+
+# Local Claude Code settings (machine-specific permissions)
+.claude/settings.local.json

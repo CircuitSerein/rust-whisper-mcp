@@ -2,6 +2,15 @@
 name = "rust-whisper-mcp"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Local MCP + REST server wrapping Whisper large-v3 on GPU: transcribe local media or YouTube URLs."
+repository = "https://github.com/CircuitSerein/rust-whisper-mcp"
+readme = "README.md"
+keywords = ["whisper", "mcp", "transcription", "cuda", "speech-to-text"]
+categories = ["multimedia::audio", "command-line-utilities"]
+# Not a library/crate for crates.io — this is a deployable server. Guard against
+# an accidental `cargo publish`.
+publish = false
 
 [dependencies]
 rmcp = { version = "1.5", features = [
@@ -15,7 +24,7 @@ axum = "0.7"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 
-whisper-rs = { version = "0.13", features = ["cuda"] }
+whisper-rs = { version = "0.13" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -29,6 +38,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 which = "7"
+
+[features]
+# GPU build is the default (and what the Docker image uses). CI and CPU-only
+# dev disable it with `--no-default-features`, which builds whisper.cpp for CPU
+# and skips the CUDA toolkit requirement.
+default = ["cuda"]
+cuda = ["whisper-rs/cuda"]
 
 [profile.release]
 lto = "thin"

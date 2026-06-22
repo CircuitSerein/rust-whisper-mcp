@@ -2,5 +2,8 @@ target/
 data/
 models/
 .git/
+.github/
 .claude/
+.env
+.env.*
 *.md

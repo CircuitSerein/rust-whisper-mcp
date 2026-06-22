@@ -13,18 +13,17 @@ use tokio::process::Command;
 pub async fn decode_to_pcm(input: &Path) -> Result<Vec<f32>> {
     let started = Instant::now();
     let out = Command::new("ffmpeg")
-        .args([
-            "-nostdin",
-            "-loglevel",
-            "error",
-            "-i",
-        ])
+        .args(["-nostdin", "-loglevel", "error", "-i"])
         .arg(input)
         .args([
-            "-f", "s16le",
-            "-ac", "1",
-            "-ar", "16000",
-            "-acodec", "pcm_s16le",
+            "-f",
+            "s16le",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-acodec",
+            "pcm_s16le",
             "-",
         ])
         .stdout(Stdio::piped())
@@ -43,7 +42,10 @@ pub async fn decode_to_pcm(input: &Path) -> Result<Vec<f32>> {
 
     let bytes = out.stdout;
     if bytes.len() % 2 != 0 {
-        return Err(anyhow!("ffmpeg s16 output has odd byte length: {}", bytes.len()));
+        return Err(anyhow!(
+            "ffmpeg s16 output has odd byte length: {}",
+            bytes.len()
+        ));
     }
     let samples: Vec<f32> = bytes
         .chunks_exact(2)
@@ -68,6 +70,17 @@ pub async fn decode_to_pcm(input: &Path) -> Result<Vec<f32>> {
 /// ffmpeg anyway, so an extra wav conversion is wasted work. The smallest
 /// audio stream is enough since we downsample to 16 kHz mono regardless.
 pub async fn download_youtube(url: &str, dest_dir: &Path) -> Result<PathBuf> {
+    // Validate the scheme before handing the URL to yt-dlp. yt-dlp will happily
+    // accept file:// and other local schemes, which would turn this into an
+    // arbitrary host-file reader; restrict to http(s).
+    let parsed = url::Url::parse(url).with_context(|| format!("invalid URL: {url}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(anyhow!(
+            "unsupported URL scheme '{}' — only http/https are allowed",
+            parsed.scheme()
+        ));
+    }
+
     let started = Instant::now();
     tokio::fs::create_dir_all(dest_dir).await.ok();
     let id = uuid::Uuid::new_v4();
@@ -82,12 +95,15 @@ pub async fn download_youtube(url: &str, dest_dir: &Path) -> Result<PathBuf> {
             // YouTube now uses JS-based "n" challenge tokens. We have deno
             // installed; this flag lets yt-dlp also fetch the EJS solver
             // script from GitHub (cached after first run).
-            "--remote-components", "ejs:github",
+            "--remote-components",
+            "ejs:github",
             // Modern format selection: best audio-only stream, sorted to prefer
             // smallest size / lowest bitrate first. Falls back to "ba" alone if
             // a source only exposes muxed video+audio.
-            "-f", "ba/bestaudio",
-            "-S", "+size,+br",
+            "-f",
+            "ba/bestaudio",
+            "-S",
+            "+size,+br",
             "-o",
         ])
         .arg(&out_template)
@@ -104,13 +120,18 @@ pub async fn download_youtube(url: &str, dest_dir: &Path) -> Result<PathBuf> {
 
     // Find the produced file (extension depends on source — m4a/webm/opus/etc.)
     let prefix = format!("{id}.");
-    let mut entries = tokio::fs::read_dir(dest_dir).await.context("read dest_dir")?;
+    let mut entries = tokio::fs::read_dir(dest_dir)
+        .await
+        .context("read dest_dir")?;
     while let Some(entry) = entries.next_entry().await.context("read_dir entry")? {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.starts_with(&prefix) {
             let path = entry.path();
-            let size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+            let size = tokio::fs::metadata(&path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
             tracing::info!(
                 path = %path.display(),
                 bytes = size,

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt · clippy · test · build (no CUDA)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # whisper.cpp (via whisper-rs-sys) needs cmake + a C/C++ compiler, and
+      # bindgen needs libclang. CUDA is intentionally NOT installed here — the
+      # `--no-default-features` flag drops the `cuda` feature so whisper builds
+      # for CPU. The GPU path is exercised by the Docker image, not by CI.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo + build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --no-default-features --all-targets
+
+      - name: build
+        run: cargo build --no-default-features --release
