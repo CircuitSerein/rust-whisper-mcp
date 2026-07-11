@@ -3,14 +3,14 @@
 [![CI](https://github.com/CircuitSerein/rust-whisper-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/CircuitSerein/rust-whisper-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Local MCP server: Whisper large-v3 on a dedicated NVIDIA GPU via Docker. Transcribes local media or any yt-dlp URL — and **analyzes video**, returning keyframes as images alongside a timestamped transcript so a vision model (Claude in Claude Code, etc.) can "see" the video. Written in Rust (rmcp + whisper-rs CUDA + ffmpeg 8.1).
+Local MCP server: Whisper large-v3 on a dedicated NVIDIA GPU via Docker. Transcribes local media or any yt-dlp URL — and **analyzes video**, returning keyframes as images alongside a timestamped transcript so a vision model (Claude in Claude Code, etc.) can "see" the video. Think of it as a simple, self-hosted take on Google Gemini–style video understanding, on your own GPU. Written in Rust (rmcp + whisper-rs CUDA + ffmpeg 8.1).
 
 Tools: `transcribe_file`, `transcribe_youtube`, `analyze_file`, `analyze_youtube`, `extract_frames`, `estimate_video_cost`.
 
 ## Stack
 
-- Rust + [`rmcp`](https://docs.rs/rmcp) 1.5 — MCP server, Streamable HTTP transport
-- [`whisper-rs`](https://docs.rs/whisper-rs) 0.13 with `cuda` feature — GGML large-v3 on GPU
+- Rust + [`rmcp`](https://docs.rs/rmcp) 2.2 — MCP server, Streamable HTTP transport
+- [`whisper-rs`](https://docs.rs/whisper-rs) 0.16 with `cuda` feature — GGML large-v3 on GPU
 - `ffmpeg` (any → 16kHz mono PCM) + `yt-dlp` (YouTube → wav)
 - Docker Compose, CUDA 12.4 runtime, single GPU selected by `GPU_INDEX` (default `1`, 0-indexed)
 
