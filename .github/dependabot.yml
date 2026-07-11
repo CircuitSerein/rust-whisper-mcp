@@ -8,22 +8,12 @@ updates:
     groups:
       cargo-minor:
         update-types: [minor, patch]
-    ignore:
-      # These are constrained by rmcp (it pulls axum 0.8 / schemars 1.x
-      # transitively). Bumping our direct pins piecemeal desyncs us from rmcp —
-      # upgrade them only as part of a deliberate rmcp bump, not automatically.
-      - dependency-name: "axum"
-      - dependency-name: "schemars"
-      - dependency-name: "tower"
-      - dependency-name: "tower-http"
-      # Take major bumps deliberately, not on autopilot.
-      - dependency-name: "*"
-        update-types: ["version-update:semver-major"]
+    # Policy: stay current, majors included. Minor/patch are grouped into one PR;
+    # majors surface as individual PRs to take deliberately. Note: an rmcp major
+    # governs axum/schemars transitively — when taking one, bump axum in lockstep
+    # and re-verify the build (see the rmcp 1.x→2.x migration for the pattern).
 
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
-    ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-major"]

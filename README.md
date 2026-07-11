@@ -3,7 +3,9 @@
 [![CI](https://github.com/CircuitSerein/rust-whisper-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/CircuitSerein/rust-whisper-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Local MCP server: Whisper large-v3 on a dedicated NVIDIA GPU via Docker, exposing two tools — `transcribe_file` (local media) and `transcribe_youtube` (any yt-dlp URL). Written in Rust (rmcp + whisper-rs CUDA).
+Local MCP server: Whisper large-v3 on a dedicated NVIDIA GPU via Docker. Transcribes local media or any yt-dlp URL — and **analyzes video**, returning keyframes as images alongside a timestamped transcript so a vision model (Claude in Claude Code, etc.) can "see" the video. Written in Rust (rmcp + whisper-rs CUDA + ffmpeg 8.1).
+
+Tools: `transcribe_file`, `transcribe_youtube`, `analyze_file`, `analyze_youtube`, `extract_frames`, `estimate_video_cost`.
 
 ## Stack
 
@@ -92,6 +94,29 @@ Then in Claude Code: `/mcp` to confirm `whisper` is connected, and tools `transc
 
 Progress notifications fire if the MCP client sends a `progressToken` (Claude Code does).
 
+## Video analysis
+
+`analyze_file` / `analyze_youtube` extract keyframes and transcribe in one call,
+returning a mixed result: metadata, then each frame as an image labelled `[frame N] MM:SS`,
+then the `[MM:SS] text` transcript — so the model can line up what's on screen with
+what's said. `estimate_video_cost` previews the token cost first (no whisper, no images);
+`extract_frames` returns frames only (no transcript).
+
+```json
+// estimate first (cheap — no images, no transcription)
+{ "path": "recipe.mp4", "quality": "medium", "sampling": "scene" }
+// then analyze
+{ "path": "recipe.mp4", "quality": "medium", "sampling": "scene", "max_frames": 10 }
+// youtube, uniform sampling, grid contact-sheet layout
+{ "url": "https://youtu.be/...", "sampling": "uniform", "fps": 0.5, "layout": "grid" }
+```
+
+Options: `quality` = `compact` (640px) · `low` (854) · `medium` (1280, default) · `high`
+(1568 — the recommended ingest ceiling; larger is pointless/rejected). `sampling` =
+`scene` (default, on scene changes; tune `scene_threshold` 0.1–0.6) or `uniform` (`fps`).
+`max_frames` defaults to 10, hard-capped at 20. `layout` = `frames` (default) or `grid`.
+GPU (NVDEC) decode is used when available (`FFMPEG_HWACCEL`, default `auto`).
+
 ## CLI usage (no MCP client needed)
 
 Plain HTTP endpoints sit alongside the MCP transport, so you can transcribe from any shell:
@@ -99,6 +124,10 @@ Plain HTTP endpoints sit alongside the MCP transport, so you can transcribe from
 - `POST /api/transcribe/upload?filename=foo.mp4&language=ru` — raw body is the file bytes. Use for files that don't live under `D:\whisper-data`. Always cleaned up server-side.
 - `POST /api/transcribe/file` — JSON `{"path": "...", "language": "ru", "cleanup": false}`. Path must resolve under `DATA_DIR`.
 - `POST /api/transcribe/youtube` — JSON `{"url": "...", "language": "ru", "cleanup": true}`.
+- `POST /api/estimate` — JSON `{"path": "..."}` or `{"url": "..."}` (+ `quality`, `sampling`, `max_frames`). Returns the token estimate, no images.
+- `POST /api/analyze/file` — JSON `{"path": "...", "quality": "medium", "max_frames": 10, "layout": "frames"}`. Returns metadata, base64 frames, and the timestamped transcript.
+- `POST /api/analyze/youtube` — JSON `{"url": "...", ...}`. Same shape as analyze/file.
+- `POST /api/extract-frames` — JSON `{"path": "...", ...}`. Frames only, no transcript.
 
 Each returns `{"text": "...", "language": "ru", "segments": 42, "elapsed_ms": 4732}`.
 
@@ -165,10 +194,10 @@ This is exactly what CI runs. See [CONTRIBUTING.md](CONTRIBUTING.md) for the ful
 
 ```
 src/
-  main.rs       # axum: /health, /mcp (MCP), /api/transcribe/* (REST)
-  handler.rs    # WhisperServer: shared run_file / run_youtube + MCP tool wrappers
-  whisper.rs    # WhisperContext loading + transcribe_pcm (Mutex-serialized)
-  media.rs      # ffmpeg decode, yt-dlp download, cleanup
+  main.rs       # axum: /health, /mcp (MCP), /api/transcribe/* + /api/analyze/* (REST)
+  handler.rs    # WhisperServer: shared run_* cores (transcribe + analyze) + MCP tool wrappers
+  whisper.rs    # WhisperContext loading + transcribe_pcm (Mutex-serialized), timed segments
+  media.rs      # ffmpeg decode + keyframe extraction, yt-dlp audio/video download, ffprobe
   paths.rs      # path normalization (Windows / WSL / container forms → /data/*)
 Dockerfile      # multi-stage cargo-chef + CUDA runtime
 docker-compose.yml

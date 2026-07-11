@@ -25,6 +25,12 @@ services:
       # device_ids reservation below is ignored, so this is the real selector.
       # Override via GPU_INDEX in .env (see .env.example).
       CUDA_VISIBLE_DEVICES: "${GPU_INDEX:-1}"
+      # ffmpeg hardware-accelerated decode for keyframe extraction: auto (GPU when
+      # available, else CPU) | none (force CPU) | cuda. Default auto.
+      FFMPEG_HWACCEL: ${FFMPEG_HWACCEL:-auto}
+      # Optional blended USD-per-1M-tokens rate for estimate_video_cost. Empty =
+      # token counts only, no $ figure (model-agnostic; set to your model's rate).
+      TOKEN_COST_USD_PER_MTOK: ${TOKEN_COST_USD_PER_MTOK:-}
     volumes:
       # Host directory dropped into the container at /data. Set WHISPER_DATA_DIR
       # in .env (Windows/Docker Desktop wants forward slashes, e.g. D:/whisper-data).

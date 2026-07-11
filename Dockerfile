@@ -32,12 +32,24 @@ RUN cargo build --release --bin rust-whisper-mcp
 FROM nvidia/cuda:${CUDA_VER}-runtime-ubuntu22.04 AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Layer 1: apt packages (rarely changes)
+# Layer 1: apt packages (rarely changes). ffmpeg comes from a static build below,
+# NOT apt — Ubuntu 22.04 ships ffmpeg 4.4, and we want current scene/metadata
+# filters + -fps_mode + GPU (NVDEC) decode.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl ffmpeg python3 python3-pip unzip \
+    ca-certificates curl xz-utils python3 python3-pip unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Layer 2: deno — required by yt-dlp for YouTube JS extraction (independently cacheable)
+# Layer 2a: ffmpeg 8.1 (BtbN static, GPL). Tracks the 8.1 release branch (picks up
+# 8.1.x patches on rebuild). For byte-reproducible images, pin an autobuild-YYYY-MM-DD
+# release tag instead of `latest`. Ships self-contained ffmpeg + ffprobe with NVDEC.
+RUN curl -fsSL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz \
+      -o /tmp/ffmpeg.tar.xz \
+ && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp \
+ && install -m755 /tmp/ffmpeg-n8.1-latest-linux64-gpl-8.1/bin/ffmpeg  /usr/local/bin/ffmpeg \
+ && install -m755 /tmp/ffmpeg-n8.1-latest-linux64-gpl-8.1/bin/ffprobe /usr/local/bin/ffprobe \
+ && rm -rf /tmp/ffmpeg*
+
+# Layer 2b: deno — required by yt-dlp for YouTube JS extraction (independently cacheable)
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 
 # Layer 3: pip packages (independently cacheable)

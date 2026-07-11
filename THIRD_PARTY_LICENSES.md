@@ -35,7 +35,7 @@ in the Software without restriction ... (full text at the project repository).
 
 | Component | License | Notes |
 | --- | --- | --- |
-| [ffmpeg](https://ffmpeg.org/legal.html) | LGPL-2.1+ / GPL (build-dependent) | Installed from Ubuntu apt. Audio decode. |
+| [ffmpeg](https://ffmpeg.org/legal.html) 8.1 | **GPL-3.0** | Static [BtbN](https://github.com/BtbN/FFmpeg-Builds) `-gpl` build (not apt). Audio decode + video keyframe extraction (scene/metadata filters, NVDEC). The GPL flavor is deliberate; if you redistribute the image, its GPL terms govern. |
 | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Unlicense | Installed via pip. URL download. |
 | [Deno](https://github.com/denoland/deno) | MIT | Installed for yt-dlp's JS challenge solver. |
 | NVIDIA CUDA runtime | NVIDIA proprietary EULA | Base image `nvidia/cuda:*-runtime`. Redistribution governed by NVIDIA's terms. |

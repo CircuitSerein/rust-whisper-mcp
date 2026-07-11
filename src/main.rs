@@ -21,7 +21,10 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
-use crate::handler::{TranscribeResult, WhisperServer};
+use crate::handler::{
+    AnalyzeFileArgs, AnalyzeResult, AnalyzeYoutubeArgs, EstimateArgs, ExtractFramesArgs,
+    TokenEstimate, TranscribeResult, WhisperServer,
+};
 
 #[derive(Clone)]
 struct AppState {
@@ -70,11 +73,15 @@ async fn main() -> Result<()> {
         std::env::var("WHISPER_MODEL_PATH").unwrap_or_else(|_| "/models/ggml-large-v3.bin".into());
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into());
     let bind = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
+    // Optional blended USD-per-1M-tokens rate; when unset, cost estimates omit `$`.
+    let cost_per_mtok = std::env::var("TOKEN_COST_USD_PER_MTOK")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok());
 
     tracing::info!(model = %model_path, data = %data_dir, bind = %bind, "starting rust-whisper-mcp");
 
     let engine = Arc::new(whisper::Engine::load(&model_path).context("load whisper model")?);
-    let server = WhisperServer::new(engine, data_dir.into());
+    let server = WhisperServer::new(engine, data_dir.into(), cost_per_mtok);
 
     let mcp_server = server.clone();
     let mcp_service = StreamableHttpService::new(
@@ -96,11 +103,17 @@ async fn main() -> Result<()> {
             "/api/transcribe/upload",
             post(api_transcribe_upload).layer(DefaultBodyLimit::max(UPLOAD_LIMIT)),
         )
+        .route("/api/analyze/file", post(api_analyze_file))
+        .route("/api/analyze/youtube", post(api_analyze_youtube))
+        .route("/api/estimate", post(api_estimate))
+        .route("/api/extract-frames", post(api_extract_frames))
         .with_state(state)
         .nest_service("/mcp", mcp_service);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    tracing::info!("listening on http://{bind} (MCP at /mcp, REST at /api/transcribe/*)");
+    tracing::info!(
+        "listening on http://{bind} (MCP at /mcp, REST at /api/transcribe/* and /api/analyze/*)"
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -142,6 +155,54 @@ async fn api_transcribe_youtube(
     let res = state
         .server
         .run_youtube(&req.url, req.language.as_deref(), req.cleanup, |_| {})
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(res))
+}
+
+async fn api_analyze_file(
+    State(state): State<AppState>,
+    Json(req): Json<AnalyzeFileArgs>,
+) -> Result<Json<AnalyzeResult>, ApiError> {
+    let res = state
+        .server
+        .run_analyze_file(&req, |_| {})
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(res))
+}
+
+async fn api_analyze_youtube(
+    State(state): State<AppState>,
+    Json(req): Json<AnalyzeYoutubeArgs>,
+) -> Result<Json<AnalyzeResult>, ApiError> {
+    let res = state
+        .server
+        .run_analyze_youtube(&req, |_| {})
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(res))
+}
+
+async fn api_estimate(
+    State(state): State<AppState>,
+    Json(req): Json<EstimateArgs>,
+) -> Result<Json<TokenEstimate>, ApiError> {
+    let res = state
+        .server
+        .run_estimate(&req)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(res))
+}
+
+async fn api_extract_frames(
+    State(state): State<AppState>,
+    Json(req): Json<ExtractFramesArgs>,
+) -> Result<Json<AnalyzeResult>, ApiError> {
+    let res = state
+        .server
+        .run_extract_frames(&req)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(res))
