@@ -344,8 +344,13 @@ fn build_filtergraph(params: &ExtractParams, pts_file: &Path) -> String {
         .box_px
         .map(|b| format!("scale='min({b},iw)':'min({b},ih)':force_original_aspect_ratio=decrease,"))
         .unwrap_or_default();
+    // `metadata=print` only emits its `frame:N … pts_time:T` header for frames that
+    // carry at least one metadata entry. `select` (scene) attaches `lavfi.scene_score`
+    // so its frames print; `fps` (uniform) attaches nothing, so the sidecar comes out
+    // EMPTY and every timestamp is lost. Stamp a throwaway key first so the header
+    // fires for every kept frame in both modes.
     format!(
-        "{select}{scale}metadata=print:file={}",
+        "{select}{scale}metadata=add:key=ts:value=1,metadata=print:file={}",
         pts_file.to_string_lossy()
     )
 }
@@ -696,6 +701,30 @@ mod tests {
     #[test]
     fn parse_pts_ignores_non_pts_lines() {
         assert!(parse_metadata_pts("no timestamps here\nkey=value").is_empty());
+    }
+
+    #[test]
+    fn filtergraph_stamps_metadata_before_print_in_both_modes() {
+        // Regression: `fps` (uniform) attaches no frame metadata, so `metadata=print`
+        // alone wrote an empty sidecar and every timestamp was lost. The `metadata=add`
+        // guard must precede `metadata=print` in BOTH sampling modes.
+        let pts = Path::new("/tmp/pts.txt");
+        for sampling in [
+            SamplingMode::Uniform { fps: 0.5 },
+            SamplingMode::Scene { threshold: 0.4 },
+        ] {
+            let g = build_filtergraph(
+                &ExtractParams {
+                    box_px: Some(854),
+                    sampling,
+                    max_frames: 10,
+                },
+                pts,
+            );
+            let add = g.find("metadata=add").expect("metadata=add present");
+            let print = g.find("metadata=print").expect("metadata=print present");
+            assert!(add < print, "metadata=add must precede print in {g}");
+        }
     }
 
     #[test]

@@ -217,10 +217,12 @@ impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
         let message = format!("{e:#}");
         // Path-traversal / bad-input errors come from `paths::resolve_in_data_dir`
-        // and surface here with "resolve path" context.
+        // and surface here with "resolve path" context. An unsupported URL scheme is
+        // likewise bad client input (from `media::probe_remote`/`download_video`).
         let status = if message.contains("path traversal")
             || message.contains("escapes DATA_DIR")
             || message.contains("outside DATA_DIR")
+            || message.contains("unsupported URL scheme")
         {
             StatusCode::BAD_REQUEST
         } else {
