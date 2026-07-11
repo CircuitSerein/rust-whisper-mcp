@@ -1,0 +1,11 @@
+{
+  "_comment": "Project settings for using the whisper MCP server from Claude Code. Auto-allows the LOCAL, DATA_DIR-scoped read tools so the video-analyst subagent can page a long video unattended (an un-allowed tool stalls its loop on the first call). These only read media already under DATA_DIR and never write/delete outside it. The *_youtube tools are deliberately NOT auto-allowed: they run yt-dlp, which fetches+executes a remote JS challenge solver on an arbitrary (http/https-only) URL — a remote-fetch surface that should keep a human-in-the-loop prompt. Allow them in .claude/settings.local.json if you want fully unattended URL analysis. Optional: raise MAX_MCP_OUTPUT_TOKENS (default 25000) to carry more frames per call.",
+  "permissions": {
+    "allow": [
+      "mcp__whisper__estimate_video_cost",
+      "mcp__whisper__transcribe_file",
+      "mcp__whisper__extract_frames",
+      "mcp__whisper__analyze_file"
+    ]
+  }
+}

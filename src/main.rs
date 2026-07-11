@@ -223,6 +223,8 @@ impl From<anyhow::Error> for ApiError {
             || message.contains("escapes DATA_DIR")
             || message.contains("outside DATA_DIR")
             || message.contains("unsupported URL scheme")
+            || message.contains("invalid window")
+            || message.contains("no video stream")
         {
             StatusCode::BAD_REQUEST
         } else {

@@ -163,6 +163,7 @@ pub async fn delete_dir_quiet(p: &Path) {
 /// Video metadata from ffprobe.
 #[derive(Debug, Clone)]
 pub struct VideoMeta {
+    /// Video dimensions, or `0` for an audio-only input (no video stream).
     pub width: u32,
     pub height: u32,
     /// Duration in seconds; `NAN` when ffprobe cannot determine it (some webm/
@@ -195,6 +196,17 @@ pub struct ExtractParams {
     pub box_px: Option<u32>,
     pub sampling: SamplingMode,
     pub max_frames: u32,
+    /// Drop near-identical consecutive frames via ffmpeg `mpdecimate` before
+    /// scaling/printing. Collapses static runs (e.g. a held end-card or a paused
+    /// screencast) so a uniform sample doesn't return N copies of one shot.
+    /// Near-no-op for scene sampling, which already picks distinct frames.
+    pub dedup: bool,
+    /// Extract only from this source time onward (seconds). `None`/≤0 = from start.
+    /// Frame timestamps are reported ABSOLUTE (offset by this), so `[MM:SS]` stays
+    /// correct when paginating a long video one window at a time.
+    pub start_secs: Option<f64>,
+    /// Extract only up to this source time (seconds). `None` = to end of video.
+    pub end_secs: Option<f64>,
 }
 
 /// Probe a media file for video dimensions, duration, and audio-stream presence.
@@ -204,7 +216,7 @@ pub async fn probe_video(input: &Path) -> Result<VideoMeta> {
             "-v",
             "error",
             "-show_entries",
-            "stream=width,height,codec_type:format=duration",
+            "stream=width,height,codec_type:stream_disposition=attached_pic:format=duration",
             "-of",
             "json",
         ])
@@ -249,6 +261,16 @@ async fn extract_into(input: &Path, dir: &Path, params: &ExtractParams) -> Resul
     let out_pattern = dir.join("f_%05d.jpg");
     let vf = build_filtergraph(params, &pts_file);
 
+    // Optional time window: input-seek `-ss` (fast) from `start`, `-t` for its
+    // duration. No `-copyts`, so ffmpeg re-bases timestamps to 0 at the seek point;
+    // we add `window_start` back below to report ABSOLUTE times.
+    let window_start = params.start_secs.filter(|s| s.is_finite() && *s > 0.0);
+    let from = window_start.unwrap_or(0.0);
+    let dur = params
+        .end_secs
+        .filter(|e| e.is_finite() && *e > from)
+        .map(|e| e - from);
+
     // GPU decode first (NVDEC — separate silicon from whisper's CUDA cores), then
     // CPU fallback so a missing/unsupported GPU or odd codec never breaks
     // extraction. `-hwaccel auto` self-falls-back within the process; the explicit
@@ -262,7 +284,16 @@ async fn extract_into(input: &Path, dir: &Path, params: &ExtractParams) -> Resul
     let mut last_err = None;
     for attempt in &attempts {
         clear_dir_files(dir).await; // fresh slate per attempt
-        match run_ffmpeg_extract(input, &vf, &out_pattern, attempt.as_deref()).await {
+        match run_ffmpeg_extract(
+            input,
+            &vf,
+            &out_pattern,
+            attempt.as_deref(),
+            window_start,
+            dur,
+        )
+        .await
+        {
             Ok(()) => {
                 last_err = None;
                 break;
@@ -278,11 +309,16 @@ async fn extract_into(input: &Path, dir: &Path, params: &ExtractParams) -> Resul
     }
 
     // Timestamps from the metadata sidecar (log-level independent, 1:1 ordered).
-    let pts = parse_metadata_pts(
+    // Add `from` so a windowed extract reports ABSOLUTE source times, not window-
+    // relative ones (ffmpeg re-based them to 0 at the seek point).
+    let pts: Vec<f64> = parse_metadata_pts(
         &tokio::fs::read_to_string(&pts_file)
             .await
             .unwrap_or_default(),
-    );
+    )
+    .into_iter()
+    .map(|t| t + from)
+    .collect();
 
     // Frame files, sorted (zero-padded name ⇒ lexical order == numeric order).
     let mut files: Vec<PathBuf> = Vec::new();
@@ -340,6 +376,13 @@ fn build_filtergraph(params: &ExtractParams, pts_file: &Path) -> String {
         SamplingMode::Scene { threshold } => format!("select='eq(n,0)+gt(scene,{threshold})',"),
         SamplingMode::Uniform { fps } => format!("fps={fps},"),
     };
+    // `mpdecimate` drops frames too similar to the last KEPT one. It removes them
+    // from the stream entirely (downstream `scale`/`metadata` never see them), and
+    // `-fps_mode vfr` (set in run_ffmpeg_extract) stops the muxer re-inserting them —
+    // so the sidecar and the written JPEGs stay 1:1. It MUST sit before `metadata=print`
+    // for that reason. After `select` (scene) it's a near-no-op; after `fps` (uniform)
+    // it collapses static runs so a held shot yields one frame, not a dozen dupes.
+    let dedup = if params.dedup { "mpdecimate," } else { "" };
     let scale = params
         .box_px
         .map(|b| format!("scale='min({b},iw)':'min({b},ih)':force_original_aspect_ratio=decrease,"))
@@ -350,7 +393,7 @@ fn build_filtergraph(params: &ExtractParams, pts_file: &Path) -> String {
     // EMPTY and every timestamp is lost. Stamp a throwaway key first so the header
     // fires for every kept frame in both modes.
     format!(
-        "{select}{scale}metadata=add:key=ts:value=1,metadata=print:file={}",
+        "{select}{dedup}{scale}metadata=add:key=ts:value=1,metadata=print:file={}",
         pts_file.to_string_lossy()
     )
 }
@@ -360,16 +403,26 @@ async fn run_ffmpeg_extract(
     vf: &str,
     out_pattern: &Path,
     hwaccel: Option<&str>,
+    start_secs: Option<f64>,
+    dur_secs: Option<f64>,
 ) -> Result<()> {
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-nostdin", "-loglevel", "error"]);
+    // Input-seek `-ss` before `-i` (fast, demuxer-level). Both it and `-hwaccel`
+    // are input options and must precede `-i`.
+    if let Some(s) = start_secs {
+        cmd.args(["-ss".to_string(), format!("{s}")]);
+    }
     if let Some(hw) = hwaccel {
         // -hwaccel must precede -i to accelerate decoding of the input.
         cmd.args(["-hwaccel", hw]);
     }
-    cmd.arg("-i")
-        .arg(input)
-        .args(["-an", "-vf", vf, "-fps_mode", "vfr", "-q:v", "2"])
+    cmd.arg("-i").arg(input);
+    // `-t` (duration) is an output option — it caps how much of the window is read.
+    if let Some(d) = dur_secs {
+        cmd.args(["-t".to_string(), format!("{d}")]);
+    }
+    cmd.args(["-an", "-vf", vf, "-fps_mode", "vfr", "-q:v", "2"])
         .arg(out_pattern)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -508,11 +561,18 @@ fn hwaccel_mode() -> String {
 }
 
 fn parse_probe_json(bytes: &[u8]) -> Result<VideoMeta> {
+    #[derive(serde::Deserialize, Default)]
+    struct Disposition {
+        #[serde(default)]
+        attached_pic: i64,
+    }
     #[derive(serde::Deserialize)]
     struct Stream {
         width: Option<u32>,
         height: Option<u32>,
         codec_type: Option<String>,
+        #[serde(default)]
+        disposition: Disposition,
     }
     #[derive(serde::Deserialize, Default)]
     struct Format {
@@ -526,17 +586,18 @@ fn parse_probe_json(bytes: &[u8]) -> Result<VideoMeta> {
         format: Format,
     }
     let probe: Probe = serde_json::from_slice(bytes).context("parse ffprobe json")?;
+    // The video stream is OPTIONAL: audio-only inputs (mp3, the audio-only youtube
+    // download) probe fine and report 0×0 so the transcription path can still surface
+    // duration + audio. Callers that require pixels (analyze/extract) guard on width>0.
+    // Exclude attached-picture streams: embedded cover art (mp3/m4a/flac album art)
+    // probes as a "video" stream with real dims but disposition.attached_pic=1 — treat
+    // such a file as audio-only, not a 1-frame video, so it routes to transcribe_*.
     let video = probe
         .streams
         .iter()
-        .find(|s| s.codec_type.as_deref() == Some("video"))
-        .ok_or_else(|| anyhow!("no video stream found"))?;
-    let width = video
-        .width
-        .ok_or_else(|| anyhow!("video stream has no width"))?;
-    let height = video
-        .height
-        .ok_or_else(|| anyhow!("video stream has no height"))?;
+        .find(|s| s.codec_type.as_deref() == Some("video") && s.disposition.attached_pic == 0);
+    let width = video.and_then(|v| v.width).unwrap_or(0);
+    let height = video.and_then(|v| v.height).unwrap_or(0);
     let has_audio = probe
         .streams
         .iter()
@@ -718,6 +779,9 @@ mod tests {
                     box_px: Some(854),
                     sampling,
                     max_frames: 10,
+                    dedup: false,
+                    start_secs: None,
+                    end_secs: None,
                 },
                 pts,
             );
@@ -725,6 +789,54 @@ mod tests {
             let print = g.find("metadata=print").expect("metadata=print present");
             assert!(add < print, "metadata=add must precede print in {g}");
         }
+    }
+
+    #[test]
+    fn filtergraph_inserts_mpdecimate_before_print_only_when_dedup() {
+        // dedup:true → `mpdecimate` present and ordered before `metadata=print`
+        // (it removes frames from the stream, so it must run before the sidecar is
+        // written or files.len() would diverge from pts.len()). dedup:false → absent.
+        let pts = Path::new("/tmp/pts.txt");
+        let base = ExtractParams {
+            box_px: Some(1280),
+            sampling: SamplingMode::Uniform { fps: 1.0 },
+            max_frames: 50,
+            dedup: true,
+            start_secs: None,
+            end_secs: None,
+        };
+        let on = build_filtergraph(&base, pts);
+        let md = on
+            .find("mpdecimate")
+            .expect("mpdecimate present when dedup");
+        let print = on.find("metadata=print").expect("metadata=print present");
+        assert!(md < print, "mpdecimate must precede metadata=print in {on}");
+
+        let off = build_filtergraph(
+            &ExtractParams {
+                dedup: false,
+                ..base
+            },
+            pts,
+        );
+        assert!(
+            !off.contains("mpdecimate"),
+            "no mpdecimate when dedup:false in {off}"
+        );
+    }
+
+    #[test]
+    fn window_offset_is_added_to_relative_pts() {
+        // A windowed extract seeks with `-ss` (no `-copyts`), so ffmpeg re-bases
+        // timestamps to 0 at the seek point. The extractor adds `start_secs` back,
+        // so a 0-based sidecar of a [120s, 130s] window reports 120,121,… absolute.
+        // This mirrors the exact `.map(|t| t + from)` used in `extract_into`.
+        let relative = parse_metadata_pts(
+            "frame:0 pts:0 pts_time:0\nframe:1 pts:1 pts_time:1\nframe:2 pts:2 pts_time:2\n",
+        );
+        let from = 120.0_f64;
+        let absolute: Vec<f64> = relative.into_iter().map(|t| t + from).collect();
+        assert_eq!(absolute, vec![120.0, 121.0, 122.0]);
     }
 
     #[test]
@@ -761,5 +873,29 @@ mod tests {
         let m = parse_probe_json(json).unwrap();
         assert!(!m.has_audio);
         assert!(m.duration_secs.is_nan());
+    }
+
+    #[test]
+    fn probe_json_audio_only_is_zero_dims_not_error() {
+        // The transcription path probes audio-only inputs (mp3, the audio-only youtube
+        // download). Those have no video stream — parse must still succeed, reporting
+        // 0×0 dims but a real duration + audio, so the transcript header shows length.
+        let json = br#"{"streams":[{"codec_type":"audio"}],"format":{"duration":"93.2"}}"#;
+        let m = parse_probe_json(json).unwrap();
+        assert_eq!((m.width, m.height), (0, 0));
+        assert_eq!(m.duration_secs, 93.2);
+        assert!(m.has_audio);
+    }
+
+    #[test]
+    fn probe_json_cover_art_counts_as_audio_only() {
+        // Embedded album art (mp3/m4a/flac) probes as a "video" stream with real dims
+        // but disposition.attached_pic=1. It must NOT be treated as a real video stream,
+        // else a podcast gets mislabeled "Video 500×500" and wrongly routed to analyze.
+        let json = br#"{"streams":[{"codec_type":"video","width":500,"height":500,"disposition":{"attached_pic":1}},{"codec_type":"audio"}],"format":{"duration":"612"}}"#;
+        let m = parse_probe_json(json).unwrap();
+        assert_eq!((m.width, m.height), (0, 0));
+        assert!(m.has_audio);
+        assert_eq!(m.duration_secs, 612.0);
     }
 }

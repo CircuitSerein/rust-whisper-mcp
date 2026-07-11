@@ -87,20 +87,29 @@ Then in Claude Code: `/mcp` to confirm `whisper` is connected, and tools `transc
 { "path": "lecture.mp4", "language": "en", "cleanup": false }
 // or
 { "path": "D:\\whisper-data\\lecture.mp4", "language": "en" }
+// timed [MM:SS] lines (to anchor frame windows) instead of plain text
+{ "path": "lecture.mp4", "timestamps": true }
 
 // transcribe_youtube
 { "url": "https://www.youtube.com/watch?v=...", "language": "ru" }
 ```
 
+`transcribe_*` is the **light default**: it returns the transcript plus a one-line info
+header (`Video 1920×1080 · 04:58 · lang en`) and **no images** — reach for the video
+tools below only when you actually need to *see* frames.
+
 Progress notifications fire if the MCP client sends a `progressToken` (Claude Code does).
 
 ## Video analysis
 
-`analyze_file` / `analyze_youtube` extract keyframes and transcribe in one call,
-returning a mixed result: metadata, then each frame as an image labelled `[frame N] MM:SS`,
-then the `[MM:SS] text` transcript — so the model can line up what's on screen with
-what's said. `estimate_video_cost` previews the token cost first (no whisper, no images);
-`extract_frames` returns frames only (no transcript).
+When you need the model to *see* the video, `analyze_file` / `analyze_youtube` extract
+keyframes and transcribe in one call, returning a mixed result: metadata, then the
+`[MM:SS] text` transcript, then each frame as an image labelled `[frame N] MM:SS` — so
+the model can line up what's on screen with what's said. Best for a **short clip**; for a
+long video, transcribe once and page `extract_frames` (below). `estimate_video_cost`
+previews the token cost first (no whisper, no images); `extract_frames` returns frames
+only (no transcript). Near-identical consecutive frames are dropped automatically
+(`dedup`, default on) so a static stretch never returns a dozen copies of one shot.
 
 ```json
 // estimate first (cheap — no images, no transcription)
@@ -114,8 +123,45 @@ what's said. `estimate_video_cost` previews the token cost first (no whisper, no
 Options: `quality` = `compact` (640px) · `low` (854) · `medium` (1280, default) · `high`
 (1568 — the recommended ingest ceiling; larger is pointless/rejected). `sampling` =
 `scene` (default, on scene changes; tune `scene_threshold` 0.1–0.6) or `uniform` (`fps`).
-`max_frames` defaults to 10, hard-capped at 20. `layout` = `frames` (default) or `grid`.
+`dedup` (default `true`) drops near-identical consecutive frames via ffmpeg `mpdecimate`,
+so `max_frames` is an upper bound — set `false` for a strict fixed-rate filmstrip.
+`max_frames` defaults to 10, hard-capped at 60. `layout` = `frames` (default) or `grid`.
 GPU (NVDEC) decode is used when available (`FFMPEG_HWACCEL`, default `auto`).
+
+The transcript is emitted **before** the frames on purpose: one MCP tool result is
+capped (`MAX_MCP_OUTPUT_TOKENS`, ~25k default ≈ ~18 medium frames), and the client
+truncates the tail — so the cheap, always-useful transcript survives while the
+expensive frames are what get cut if anything does.
+
+### Whole videos of any length
+
+A single call can't hold a long video (that token cap). To analyze the whole thing,
+**transcribe once, then page keyframes by time window** — `extract_frames` takes
+`start_secs`/`end_secs`, and frame timestamps stay absolute so they still line up
+with the transcript:
+
+```json
+// full [MM:SS] transcript once (cheap, no images):
+// transcribe_file → { "path": "talk.mp4", "timestamps": true }
+// then walk the video window by window (frames only; dedup drops static dupes)
+{ "path": "talk.mp4", "start_secs": 0,   "end_secs": 120, "quality": "medium", "max_frames": 12 }
+{ "path": "talk.mp4", "start_secs": 120, "end_secs": 240, "quality": "medium", "max_frames": 12 }
+// ... until end_secs reaches the duration
+```
+
+Keep each window lean — frames are heavy (~1.2k tokens each at medium) and accumulate;
+prefer `scene` sampling and reserve `medium` for the few windows where you must read
+on-screen text. Cranking `max_frames` high is a false economy even with `MAX_MCP_OUTPUT_TOKENS`
+raised — the binding limit becomes the reader's own context.
+
+For hands-off use there's a **`video-analyst` subagent** (`.claude/agents/video-analyst.md`):
+it does this loop in its own isolated context — transcribe once, page the frames,
+keep running notes — and returns a compact text report, so hundreds of frames never
+pollute the main conversation. Ask Claude Code to "use the video-analyst to summarize
+`<file or url>`". The read-only whisper tools are allow-listed in
+`.claude/settings.json` so its paginated loop runs unattended. (`analyze_file` /
+`analyze_youtube` remain the direct, single-call path for short clips when you want to
+see the frames yourself.)
 
 ## CLI usage (no MCP client needed)
 
@@ -127,7 +173,7 @@ Plain HTTP endpoints sit alongside the MCP transport, so you can transcribe from
 - `POST /api/estimate` — JSON `{"path": "..."}` or `{"url": "..."}` (+ `quality`, `sampling`, `max_frames`). Returns the token estimate, no images.
 - `POST /api/analyze/file` — JSON `{"path": "...", "quality": "medium", "max_frames": 10, "layout": "frames"}`. Returns metadata, base64 frames, and the timestamped transcript.
 - `POST /api/analyze/youtube` — JSON `{"url": "...", ...}`. Same shape as analyze/file.
-- `POST /api/extract-frames` — JSON `{"path": "...", ...}`. Frames only, no transcript.
+- `POST /api/extract-frames` — JSON `{"path": "...", "start_secs": 0, "end_secs": 120, ...}`. Frames only, no transcript; `start_secs`/`end_secs` page a long video by time window (absolute `[MM:SS]`).
 
 Each returns `{"text": "...", "language": "ru", "segments": 42, "elapsed_ms": 4732}`.
 

@@ -37,6 +37,16 @@ pub struct TranscribeResult {
     pub text: String,
     pub language: Option<String>,
     pub segments: usize,
+    /// Source duration in seconds (ffprobe); `None` when it can't be determined.
+    pub duration_secs: Option<f64>,
+    /// Video dimensions; `None` for audio-only sources.
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// Whether the source carries an audio track.
+    pub has_audio: bool,
+    /// Timed `[MM:SS]` transcript lines. Always populated in the REST body; the MCP
+    /// tool only renders them as text when the caller passes `timestamps:true`.
+    pub timed: Vec<TimedLine>,
     pub elapsed_ms: u128,
 }
 
@@ -48,9 +58,14 @@ pub struct TranscribeFileArgs {
     /// Optional ISO-639-1 language code (e.g. "en", "ru"). Auto-detect if omitted.
     #[serde(default)]
     pub language: Option<String>,
-    /// Delete the source file after successful transcription. Default: false.
+    /// Irreversibly delete the source file after a successful run. Default: false.
     #[serde(default)]
     pub cleanup: bool,
+    /// Render the transcript as timed `[MM:SS]` lines instead of plain text — use when
+    /// you need to know WHEN something was said (to cite/seek a moment, or to line the
+    /// transcript up with extracted frame windows). Default: false.
+    #[serde(default)]
+    pub timestamps: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -63,6 +78,10 @@ pub struct TranscribeYoutubeArgs {
     /// Delete the downloaded audio after successful transcription. Default: true.
     #[serde(default = "default_true")]
     pub cleanup: bool,
+    /// Render the transcript as timed `[MM:SS]` lines instead of plain text — use when
+    /// you need to know WHEN something was said (to cite/seek a moment). Default: false.
+    #[serde(default)]
+    pub timestamps: bool,
 }
 
 fn default_true() -> bool {
@@ -71,14 +90,22 @@ fn default_true() -> bool {
 
 // ============================= video analysis =============================
 
-/// Default frames returned by an analyze call; hard cap the client can't exceed.
-/// A modern host resizes each image to ≤1568px anyway and enforces per-message
-/// image/byte limits, so we keep the count deliberately small.
+/// Default frames per analyze/extract call; hard cap the client can't exceed.
+/// A single MCP tool result is bounded by the client's `MAX_MCP_OUTPUT_TOKENS`
+/// (~25k default ≈ 20 medium frames), so bigger counts only land when that env is
+/// raised or a cheaper quality is used. To cover a WHOLE long video, paginate
+/// `extract_frames` by time window (`start_secs`/`end_secs`) — each window is its
+/// own call — rather than pushing this cap higher.
 const DEFAULT_MAX_FRAMES: u32 = 10;
-const MAX_FRAMES_CAP: u32 = 20;
+const MAX_FRAMES_CAP: u32 = 60;
 const SCENE_THRESHOLD_DEFAULT: f64 = 0.4;
 const SCENE_THRESHOLD_MIN: f64 = 0.1;
 const SCENE_THRESHOLD_MAX: f64 = 0.6;
+/// Caller-supplied uniform fps is clamped: extraction buffers every emitted frame
+/// before subsampling, so an unbounded fps (or fps × a long window) is a disk/memory
+/// DoS. Cap the per-second rate AND the total emitted across the window span.
+const MAX_UNIFORM_FPS: f64 = 5.0;
+const MAX_EMITTED_FRAMES: f64 = 600.0;
 /// Anthropic's per-image token estimate divisor (`w*h / 750`).
 const PX_PER_TOKEN: u64 = 750;
 /// Rough words/min and tokens/word for the transcript estimate. The token factor
@@ -189,6 +216,65 @@ fn fmt_mmss(secs: f64) -> String {
     format!("{:02}:{:02}", total / 60, total % 60)
 }
 
+/// Assemble a `TranscribeResult` from whisper output + optional probe metadata.
+/// Shared by the file / upload / youtube transcription cores so they stay in sync.
+fn transcribe_result(
+    out: crate::whisper::TranscriptionOutput,
+    meta: Option<&media::VideoMeta>,
+    elapsed: std::time::Duration,
+) -> TranscribeResult {
+    let timed = out
+        .timed
+        .iter()
+        .map(|t| TimedLine {
+            mmss: fmt_mmss(t.start_cs as f64 / 100.0),
+            text: t.text.clone(),
+        })
+        .collect();
+    TranscribeResult {
+        text: out.text,
+        language: out.language,
+        segments: out.segments,
+        duration_secs: meta.map(|m| m.duration_secs).filter(|d| d.is_finite()),
+        width: meta.map(|m| m.width).filter(|w| *w > 0),
+        height: meta.map(|m| m.height).filter(|h| *h > 0),
+        has_audio: meta.map(|m| m.has_audio).unwrap_or(true),
+        timed,
+        elapsed_ms: elapsed.as_millis(),
+    }
+}
+
+/// One-line source header prepended to the MCP transcript text, e.g.
+/// `Video 1920×1080 · 04:58 · lang en` or `Audio · 03:12 · lang ru`.
+fn format_transcribe_header(r: &TranscribeResult) -> String {
+    let dur = r
+        .duration_secs
+        .map(fmt_mmss)
+        .unwrap_or_else(|| "??:??".to_string());
+    let lang = r.language.as_deref().unwrap_or("?");
+    match (r.width, r.height) {
+        (Some(w), Some(h)) => {
+            let no_audio = if r.has_audio { "" } else { " · no audio" };
+            format!("Video {w}×{h} · {dur} · lang {lang}{no_audio}")
+        }
+        _ => format!("Audio · {dur} · lang {lang}"),
+    }
+}
+
+/// Transcript body for MCP text output: timed `[MM:SS]` lines when requested (and
+/// available), else the plain text.
+fn transcribe_body(r: &TranscribeResult, timestamps: bool) -> String {
+    if timestamps && !r.timed.is_empty() {
+        r.timed
+            .iter()
+            .map(|l| format!("[{}] {}", l.mmss, l.text))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        r.text.clone()
+    }
+}
+
 /// Default uniform fps when the caller doesn't set one: aim for ~`max_frames`
 /// across the whole video, capped at 1 fps. Falls back to 0.5 fps if duration
 /// is unknown.
@@ -197,6 +283,33 @@ fn default_uniform_fps(duration_secs: f64, max_frames: u32) -> f64 {
         (max_frames as f64 / duration_secs).clamp(0.01, 1.0)
     } else {
         0.5
+    }
+}
+
+/// Clamp a caller-supplied uniform fps so extraction can't be driven to buffer an
+/// unbounded number of frames. Bounds the per-second rate (`MAX_UNIFORM_FPS`) and the
+/// total emitted across the window `span_secs` (`MAX_EMITTED_FRAMES`), lowering the
+/// rate rather than truncating so frames stay evenly spaced. Never returns < 0.01.
+fn clamp_uniform_fps(requested: f64, span_secs: f64) -> f64 {
+    let span_cap = if span_secs.is_finite() && span_secs > 0.0 {
+        MAX_EMITTED_FRAMES / span_secs
+    } else {
+        MAX_UNIFORM_FPS
+    };
+    let hi = MAX_UNIFORM_FPS.min(span_cap).max(0.01);
+    requested.clamp(0.01, hi)
+}
+
+/// Effective span of the extraction window (seconds), used to pick the uniform
+/// fallback fps. Falls back to the full duration when no window is set, so a
+/// windowed extract that hits the no-scene-cut fallback spreads frames over the
+/// window, not the whole video.
+fn window_span(start: Option<f64>, end: Option<f64>, full: f64) -> f64 {
+    let from = start.filter(|s| s.is_finite() && *s > 0.0).unwrap_or(0.0);
+    match end.filter(|e| e.is_finite() && *e > from) {
+        Some(e) => e - from,
+        None if full.is_finite() && full > from => full - from,
+        None => full,
     }
 }
 
@@ -214,6 +327,7 @@ fn resolve_sampling(
         Sampling::Uniform => {
             let fps = fps
                 .filter(|f| f.is_finite() && *f > 0.0)
+                .map(|f| clamp_uniform_fps(f, duration_secs))
                 .unwrap_or_else(|| default_uniform_fps(duration_secs, max_frames));
             media::SamplingMode::Uniform { fps }
         }
@@ -306,9 +420,14 @@ struct AnalyzeOpts {
     scene_threshold: Option<f64>,
     fps: Option<f64>,
     max_frames: u32,
+    dedup: bool,
     layout: Layout,
     language: Option<String>,
     transcribe: bool,
+    /// Optional [start_secs, end_secs] extraction window (extract_frames pagination).
+    /// `None` on analyze_file/youtube — those are whole-clip, single-call tools.
+    start_secs: Option<f64>,
+    end_secs: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -318,7 +437,7 @@ pub struct AnalyzeFileArgs {
     /// Optional ISO-639-1 language code (e.g. "en", "ru"). Auto-detect if omitted.
     #[serde(default)]
     pub language: Option<String>,
-    /// Delete the source file after analysis. Default: false.
+    /// Irreversibly delete the source file after analysis. Default: false.
     #[serde(default)]
     pub cleanup: bool,
     /// Frame resolution preset: compact|low|medium|high. Default: medium (1280px).
@@ -330,15 +449,23 @@ pub struct AnalyzeFileArgs {
     /// Scene-change sensitivity 0.1–0.6 (lower = more frames). Default 0.4.
     #[serde(default)]
     pub scene_threshold: Option<f64>,
-    /// Frames per second for uniform sampling. Default derived from duration.
+    /// Frames per second when sampling=uniform (clamped to a sane max). Default:
+    /// derived from duration to spread ~max_frames evenly.
     #[serde(default)]
     pub fps: Option<f64>,
-    /// Max frames to return (hard cap 20). Default 10.
+    /// Upper bound on frames returned (dedup may yield fewer). Hard cap 60, but one
+    /// result is token-capped to ~20 medium frames in practice — for a long video,
+    /// page extract_frames by window rather than raising this. Default 10.
     #[serde(default = "default_max_frames")]
     pub max_frames: u32,
-    /// Result layout: frames (default, one image per frame) or grid (contact sheet).
+    /// Result layout: frames (default, one labelled image per frame) or grid (single
+    /// contact sheet — cheap overview, sub-cells lose detail).
     #[serde(default)]
     pub layout: Layout,
+    /// Drop near-identical consecutive frames (ffmpeg mpdecimate) so static runs
+    /// don't return duplicate images. Default: true.
+    #[serde(default = "default_true")]
+    pub dedup: bool,
 }
 
 impl AnalyzeFileArgs {
@@ -349,9 +476,12 @@ impl AnalyzeFileArgs {
             scene_threshold: self.scene_threshold,
             fps: self.fps,
             max_frames: clamp_max_frames(self.max_frames),
+            dedup: self.dedup,
             layout: self.layout,
             language: self.language.clone(),
             transcribe: true,
+            start_secs: None,
+            end_secs: None,
         }
     }
 }
@@ -360,23 +490,39 @@ impl AnalyzeFileArgs {
 pub struct AnalyzeYoutubeArgs {
     /// YouTube (or any yt-dlp-supported) URL. Video+audio downloaded once.
     pub url: String,
+    /// Optional ISO-639-1 language code (e.g. "en", "ru"). Auto-detect if omitted.
     #[serde(default)]
     pub language: Option<String>,
     /// Delete the downloaded video after analysis. Default: true.
     #[serde(default = "default_true")]
     pub cleanup: bool,
+    /// Frame resolution: compact (640px) | low (854) | medium (1280) | high (1568).
+    /// Higher = clearer on-screen text but more tokens. Default: medium.
     #[serde(default)]
     pub quality: QualityPreset,
+    /// Frame sampling: scene (keyframe per scene change, default) or uniform (fixed fps).
     #[serde(default)]
     pub sampling: Sampling,
+    /// Scene-change sensitivity 0.1–0.6 (lower = more frames). Only used when
+    /// sampling=scene. Default 0.4.
     #[serde(default)]
     pub scene_threshold: Option<f64>,
+    /// Frames per second when sampling=uniform (clamped to a sane max). Default:
+    /// derived from duration to spread ~max_frames evenly.
     #[serde(default)]
     pub fps: Option<f64>,
+    /// Upper bound on frames returned (dedup may yield fewer). Hard cap 60, but one
+    /// result is token-capped to ~20 medium frames in practice — for a long video,
+    /// page extract_frames by window rather than raising this. Default 10.
     #[serde(default = "default_max_frames")]
     pub max_frames: u32,
+    /// Result layout: frames (default, one labelled image per frame) or grid (single
+    /// contact sheet — cheap overview, sub-cells lose detail).
     #[serde(default)]
     pub layout: Layout,
+    /// Drop near-identical consecutive frames (ffmpeg mpdecimate). Default: true.
+    #[serde(default = "default_true")]
+    pub dedup: bool,
 }
 
 impl AnalyzeYoutubeArgs {
@@ -387,9 +533,12 @@ impl AnalyzeYoutubeArgs {
             scene_threshold: self.scene_threshold,
             fps: self.fps,
             max_frames: clamp_max_frames(self.max_frames),
+            dedup: self.dedup,
             layout: self.layout,
             language: self.language.clone(),
             transcribe: true,
+            start_secs: None,
+            end_secs: None,
         }
     }
 }
@@ -398,21 +547,44 @@ impl AnalyzeYoutubeArgs {
 pub struct ExtractFramesArgs {
     /// Path to a video file (resolved under DATA_DIR).
     pub path: String,
+    /// Frame resolution: compact (640px) | low (854) | medium (1280) | high (1568).
+    /// Higher = clearer on-screen text but more tokens. Default: medium.
     #[serde(default)]
     pub quality: QualityPreset,
+    /// Frame sampling: scene (keyframe per scene change, default) or uniform (fixed fps).
     #[serde(default)]
     pub sampling: Sampling,
+    /// Scene-change sensitivity 0.1–0.6 (lower = more frames). Only used when
+    /// sampling=scene. Default 0.4.
     #[serde(default)]
     pub scene_threshold: Option<f64>,
+    /// Frames per second when sampling=uniform (clamped to a sane max). Default:
+    /// derived from the window duration to spread ~max_frames evenly.
     #[serde(default)]
     pub fps: Option<f64>,
+    /// Upper bound on frames returned (dedup may yield fewer). Hard cap 60, but one
+    /// result is token-capped to ~20 medium frames in practice. Default 10.
     #[serde(default = "default_max_frames")]
     pub max_frames: u32,
+    /// Result layout: frames (default, one labelled image per frame) or grid (single
+    /// contact sheet — cheap overview, sub-cells lose detail).
     #[serde(default)]
     pub layout: Layout,
-    /// Delete the source file after extraction. Default: false.
+    /// Extract only frames from this source time onward (seconds). Pair with
+    /// `end_secs` to page through a long video one window at a time — frame
+    /// timestamps are reported as absolute [MM:SS]. Default: from the start.
+    #[serde(default)]
+    pub start_secs: Option<f64>,
+    /// Extract only frames up to this source time (seconds). Default: to the end.
+    #[serde(default)]
+    pub end_secs: Option<f64>,
+    /// Irreversibly delete the source file after extraction. Default: false.
     #[serde(default)]
     pub cleanup: bool,
+    /// Drop near-identical consecutive frames (ffmpeg mpdecimate) so static runs
+    /// collapse to one image. Makes `max_frames` an upper bound. Default: true.
+    #[serde(default = "default_true")]
+    pub dedup: bool,
 }
 
 impl ExtractFramesArgs {
@@ -423,9 +595,12 @@ impl ExtractFramesArgs {
             scene_threshold: self.scene_threshold,
             fps: self.fps,
             max_frames: clamp_max_frames(self.max_frames),
+            dedup: self.dedup,
             layout: self.layout,
             language: None,
             transcribe: false,
+            start_secs: self.start_secs,
+            end_secs: self.end_secs,
         }
     }
 }
@@ -438,6 +613,8 @@ pub struct EstimateArgs {
     /// Remote URL. Metadata is fetched via yt-dlp without downloading.
     #[serde(default)]
     pub url: Option<String>,
+    /// Frame resolution the estimate assumes: compact (640px) | low (854) | medium
+    /// (1280) | high (1568). Default: medium.
     #[serde(default)]
     pub quality: QualityPreset,
     /// scene (upper-bound frame count = max_frames) or uniform (duration × fps).
@@ -446,6 +623,7 @@ pub struct EstimateArgs {
     /// Frames per second for uniform sampling. Default derived from duration.
     #[serde(default)]
     pub fps: Option<f64>,
+    /// Frame count the estimate assumes (upper bound; hard cap 60). Default 10.
     #[serde(default = "default_max_frames")]
     pub max_frames: u32,
 }
@@ -482,6 +660,17 @@ impl WhisperServer {
 
         let resolved = paths::resolve_in_data_dir(path, &self.data_dir).context("resolve path")?;
 
+        // Cheap ffprobe for duration/dimensions/audio so the transcript carries basic
+        // info without the caller reaching for the heavy image path. Failure is
+        // non-fatal — transcription still proceeds with metadata omitted — but log it,
+        // else a real video whose probe failed silently reports as "Audio · ??:??".
+        let meta = media::probe_video(&resolved)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(path = %resolved.display(), "probe_video failed: {e:#}; header omits duration/dimensions")
+            })
+            .ok();
+
         let pcm = media::decode_to_pcm(&resolved)
             .await
             .context("ffmpeg decode")?;
@@ -503,12 +692,7 @@ impl WhisperServer {
             "transcribe_file complete"
         );
 
-        Ok(TranscribeResult {
-            text: out.text,
-            language: out.language,
-            segments: out.segments,
-            elapsed_ms: elapsed.as_millis(),
-        })
+        Ok(transcribe_result(out, meta.as_ref(), elapsed))
     }
 
     /// Write uploaded bytes to an inbox under DATA_DIR, transcribe, then delete.
@@ -550,6 +734,12 @@ impl WhisperServer {
             "upload received"
         );
 
+        let meta = media::probe_video(&path)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(path = %path.display(), "probe_video failed: {e:#}; header omits duration/dimensions")
+            })
+            .ok();
         let pcm = media::decode_to_pcm(&path).await.context("ffmpeg decode")?;
         let out = self
             .transcribe_pcm_async(pcm, language, on_whisper_progress)
@@ -567,12 +757,7 @@ impl WhisperServer {
             "transcribe_upload complete"
         );
 
-        Ok(TranscribeResult {
-            text: out.text,
-            language: out.language,
-            segments: out.segments,
-            elapsed_ms: elapsed.as_millis(),
-        })
+        Ok(transcribe_result(out, meta.as_ref(), elapsed))
     }
 
     /// Shared core: download via yt-dlp, decode, transcribe, optionally cleanup.
@@ -597,6 +782,12 @@ impl WhisperServer {
             .await
             .context("yt-dlp")?;
 
+        let meta = media::probe_video(&file)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(path = %file.display(), "probe_video failed: {e:#}; header omits duration/dimensions")
+            })
+            .ok();
         let pcm = media::decode_to_pcm(&file).await.context("ffmpeg decode")?;
         let out = self
             .transcribe_pcm_async(pcm, language, on_whisper_progress)
@@ -616,12 +807,7 @@ impl WhisperServer {
             "transcribe_youtube complete"
         );
 
-        Ok(TranscribeResult {
-            text: out.text,
-            language: out.language,
-            segments: out.segments,
-            elapsed_ms: elapsed.as_millis(),
-        })
+        Ok(transcribe_result(out, meta.as_ref(), elapsed))
     }
 
     async fn transcribe_pcm_async<F>(
@@ -651,7 +837,7 @@ impl WhisperServer {
 
     #[tool(
         name = "transcribe_file",
-        description = "Transcribe a local media file (any format ffmpeg understands) to text using Whisper large-v3 on GPU. Path is resolved under the container's DATA_DIR mount."
+        description = "Transcribe a local media file (any format ffmpeg understands) with Whisper large-v3 on GPU, returning the transcript plus a one-line info header (duration, resolution, language). NO images — this is the light default for 'what does it say?'. Pass timestamps:true for [MM:SS] lines that anchor frame windows. Path is resolved under the container's DATA_DIR mount."
     )]
     async fn transcribe_file(
         &self,
@@ -666,12 +852,17 @@ impl WhisperServer {
             .run_file(&args.path, args.language.as_deref(), args.cleanup, cb)
             .await
             .map_err(|e| ErrorData::internal_error(format!("{e:#}"), None))?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(res.text)]))
+        let text = format!(
+            "{}\n{}",
+            format_transcribe_header(&res),
+            transcribe_body(&res, args.timestamps)
+        );
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
     #[tool(
         name = "transcribe_youtube",
-        description = "Download a YouTube (or any yt-dlp-supported) URL as audio and transcribe to text. The download lands under DATA_DIR and is cleaned up by default."
+        description = "Download a YouTube (or any yt-dlp-supported) URL as audio and transcribe with Whisper large-v3, returning the transcript plus a one-line info header (duration, language). NO images — the light default. Pass timestamps:true for [MM:SS] lines. The download lands under DATA_DIR and is cleaned up by default."
     )]
     async fn transcribe_youtube(
         &self,
@@ -686,7 +877,12 @@ impl WhisperServer {
             .run_youtube(&args.url, args.language.as_deref(), args.cleanup, cb)
             .await
             .map_err(|e| ErrorData::internal_error(format!("{e:#}"), None))?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(res.text)]))
+        let text = format!(
+            "{}\n{}",
+            format_transcribe_header(&res),
+            transcribe_body(&res, args.timestamps)
+        );
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
     // ---------------- video analysis cores (shared by MCP + REST) ----------------
@@ -711,6 +907,14 @@ impl WhisperServer {
             (Some(_), Some(_)) => return Err(anyhow::anyhow!("provide `path` OR `url`, not both")),
             (None, None) => return Err(anyhow::anyhow!("provide one of `path` or `url`")),
         };
+        // Mirror analyze_common's guard: an audio-only source (0×0) can't be analyzed,
+        // so don't hand back a bogus 0-visual-token estimate that the very next
+        // analyze_file call would then reject.
+        if w == 0 || h == 0 {
+            return Err(anyhow::anyhow!(
+                "no video stream — use transcribe_file for audio-only input"
+            ));
+        }
         let frame_count = match args.sampling {
             Sampling::Scene => max_frames as usize,
             Sampling::Uniform => {
@@ -767,9 +971,21 @@ impl WhisperServer {
         let file = media::download_video(&args.url, &yt_dir)
             .await
             .context("yt-dlp")?;
-        let res = self.analyze_common(&file, args.opts(), on_progress).await;
+        let mut res = self.analyze_common(&file, args.opts(), on_progress).await;
         if args.cleanup {
             media::delete_quiet(&file).await;
+        } else if let Ok(r) = res.as_mut() {
+            // Keep the download and surface its DATA_DIR-relative path so a caller
+            // can page more windows over it with extract_frames / transcribe_file
+            // (and delete it via a final extract_frames call with cleanup:true).
+            if let Ok(rel) = file.strip_prefix(&self.data_dir) {
+                r.notes.push(format!(
+                    "[downloaded video kept at {} — page more detail with \
+                     extract_frames(path, start_secs, end_secs); pass cleanup:true on \
+                     the last call to delete it]",
+                    rel.display()
+                ));
+            }
         }
         res
     }
@@ -799,18 +1015,61 @@ impl WhisperServer {
         let mut notes: Vec<String> = Vec::new();
 
         let meta = media::probe_video(file).await.context("probe video")?;
+
+        // Analyze/extract need a video stream; audio-only inputs (0×0) can't yield
+        // frames, so fail cleanly here instead of cryptically at ffmpeg. Transcription
+        // handles audio-only fine via the transcribe_* tools.
+        if meta.width == 0 || meta.height == 0 {
+            return Err(anyhow::anyhow!(
+                "no video stream — use transcribe_file for audio-only input"
+            ));
+        }
+
+        // Validate the extraction window up front: a bad window should error cheaply,
+        // not silently re-extract to EOF (which would surprise a pagination loop).
+        // end_secs must exceed the effective start (0 when start is unset), else the
+        // window silently collapses to "no bound" downstream (window_span / the `-t`
+        // computation drop a non-positive end) and extracts to EOF — surprising a
+        // pagination loop. Validate it even when start_secs is absent.
+        let start0 = opts
+            .start_secs
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or(0.0);
+        if let Some(e) = opts.end_secs {
+            if !e.is_finite() || e <= start0 {
+                return Err(anyhow::anyhow!(
+                    "invalid window: end_secs ({e}) must be greater than start_secs ({start0})"
+                ));
+            }
+        }
+        if let Some(s) = opts.start_secs {
+            if s < 0.0 || (meta.duration_secs.is_finite() && s >= meta.duration_secs) {
+                return Err(anyhow::anyhow!(
+                    "invalid window: start_secs ({s}) is out of range for a {:.3}s video",
+                    meta.duration_secs
+                ));
+            }
+        }
+
         let box_px = opts.quality.box_px();
+        // Uniform fps (when the caller gives none) must be derived from the WINDOW
+        // span, not the whole video, or a windowed uniform extract samples far too
+        // sparsely. `window_span` == full duration when no window is set.
+        let span = window_span(opts.start_secs, opts.end_secs, meta.duration_secs);
         let sampling = resolve_sampling(
             opts.sampling,
             opts.scene_threshold,
             opts.fps,
-            meta.duration_secs,
+            span,
             opts.max_frames,
         );
         let params = media::ExtractParams {
             box_px,
             sampling,
             max_frames: opts.max_frames,
+            dedup: opts.dedup,
+            start_secs: opts.start_secs,
+            end_secs: opts.end_secs,
         };
         let frames_dir = self.data_dir.join("frames");
 
@@ -839,19 +1098,28 @@ impl WhisperServer {
         let mut sampling_used = describe_sampling(sampling);
         // Zero scene cuts (static screencast) → uniform fallback so frames still return.
         if frames.is_empty() {
-            let fps = default_uniform_fps(meta.duration_secs, opts.max_frames);
+            let fps = default_uniform_fps(span, opts.max_frames);
             let uni = media::ExtractParams {
                 box_px,
                 sampling: media::SamplingMode::Uniform { fps },
                 max_frames: opts.max_frames,
+                dedup: opts.dedup,
+                start_secs: opts.start_secs,
+                end_secs: opts.end_secs,
             };
             frames = media::extract_keyframes(file, &frames_dir, &uni)
                 .await
                 .context("uniform fallback extract")?;
-            notes.push(format!(
-                "[no scene cuts detected — sampled uniformly at {fps:.3} fps]"
-            ));
-            sampling_used = format!("scene→uniform(fps={fps:.3})");
+            if frames.is_empty() {
+                // Genuinely nothing here (e.g. a window past the end of the video) —
+                // don't claim uniform sampling happened.
+                notes.push("[no frames in the requested range]".to_string());
+            } else {
+                notes.push(format!(
+                    "[no scene cuts detected — sampled uniformly at {fps:.3} fps]"
+                ));
+                sampling_used = format!("scene→uniform(fps={fps:.3})");
+            }
         }
 
         // Duration: prefer ffprobe; else last frame timestamp as a lower bound.
@@ -932,7 +1200,7 @@ impl WhisperServer {
 
     #[tool(
         name = "estimate_video_cost",
-        description = "Estimate the token/cost of analyzing a video (local path or URL) at given settings, WITHOUT running whisper or returning any images. Call this first to preview cost, then analyze_file/analyze_youtube."
+        description = "Preview the token cost (and USD if a rate is configured) of a frame extraction WITHOUT running whisper or returning images — fast, it only probes metadata. Returns per-frame and total token counts. Use before analyze_file/analyze_youtube, or to size max_frames / a window for extract_frames. Provide path OR url, not both; audio-only input errors."
     )]
     async fn estimate_video_cost(
         &self,
@@ -952,7 +1220,7 @@ impl WhisperServer {
 
     #[tool(
         name = "analyze_file",
-        description = "Analyze a local video: extract keyframes and transcribe, returning frames as images interleaved with a timestamped transcript so a vision model can 'see' the video. Path resolved under DATA_DIR."
+        description = "See a SHORT local video (roughly under ~2 min / a handful of scenes): extract keyframes AND transcribe in one call, returning frames as images interleaved with a timestamped transcript so a vision model can 'see' it. Video only — audio-only input errors; use transcribe_file for that. For anything longer, prefer transcribe_file once + extract_frames per window (images are ~1.2k tokens each at medium and accumulate). Path resolved under DATA_DIR."
     )]
     async fn analyze_file(
         &self,
@@ -973,7 +1241,7 @@ impl WhisperServer {
 
     #[tool(
         name = "analyze_youtube",
-        description = "Download a video URL once (video+audio), then extract keyframes and transcribe, returning frames as images plus a timestamped transcript. The download is cleaned up by default."
+        description = "See a SHORT video URL (roughly under ~2 min): download once (video+audio), extract keyframes AND transcribe, returning frames as images plus a timestamped transcript. Video only — audio-only input errors. For anything longer, prefer one transcript pass + extract_frames per window; cleanup:false keeps the download for that paging. Cleaned up by default."
     )]
     async fn analyze_youtube(
         &self,
@@ -994,7 +1262,7 @@ impl WhisperServer {
 
     #[tool(
         name = "extract_frames",
-        description = "Extract video keyframes only (no transcription), returning them as images. Same sampling/quality options as analyze_file."
+        description = "Extract video keyframes only (no transcription), returning them as images. Near-identical consecutive frames are dropped automatically (dedup — so max_frames is an upper bound). Same sampling/quality options as analyze_file, plus an optional [start_secs, end_secs] window: page through a long video one window at a time (frame timestamps stay absolute [MM:SS]). Pair with one transcribe_file(timestamps:true) call to analyze a whole video across many calls."
     )]
     async fn extract_frames(
         &self,
@@ -1091,19 +1359,15 @@ fn format_metadata(r: &AnalyzeResult) -> String {
     s
 }
 
-/// Assemble the mixed text+image tool result: metadata → frames (per-frame label +
-/// image for `frames` layout, or the single grid image) → timestamped transcript.
+/// Assemble the mixed text+image tool result: metadata → timestamped transcript →
+/// frames (per-frame label + image for `frames` layout, or the single grid image).
+///
+/// Transcript comes BEFORE the frames on purpose: a single MCP tool result is
+/// capped (`MAX_MCP_OUTPUT_TOKENS`, ~25k default) and the client truncates the
+/// tail. The transcript is the cheap, always-useful part, so it must survive; the
+/// expensive frames are the tail that gets cut first if anything does.
 fn build_content(r: &AnalyzeResult, layout: Layout) -> Vec<ContentBlock> {
     let mut blocks = vec![ContentBlock::text(format_metadata(r))];
-    for f in &r.frames {
-        if matches!(layout, Layout::Frames) {
-            blocks.push(ContentBlock::text(format!(
-                "[frame {}] {}",
-                f.index, f.mmss
-            )));
-        }
-        blocks.push(ContentBlock::image(f.jpeg_base64.clone(), "image/jpeg"));
-    }
     if !r.transcript.is_empty() {
         let body = r
             .transcript
@@ -1112,6 +1376,15 @@ fn build_content(r: &AnalyzeResult, layout: Layout) -> Vec<ContentBlock> {
             .collect::<Vec<_>>()
             .join("\n");
         blocks.push(ContentBlock::text(format!("Transcript:\n{body}")));
+    }
+    for f in &r.frames {
+        if matches!(layout, Layout::Frames) {
+            blocks.push(ContentBlock::text(format!(
+                "[frame {}] {}",
+                f.index, f.mmss
+            )));
+        }
+        blocks.push(ContentBlock::image(f.jpeg_base64.clone(), "image/jpeg"));
     }
     blocks
 }
@@ -1159,13 +1432,72 @@ impl ServerHandler for WhisperServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.instructions = Some(
-            "Whisper large-v3 transcription server running on a dedicated GPU. \
-             Use `transcribe_file` for local media (path under DATA_DIR) or \
-             `transcribe_youtube` for URLs. Progress notifications are sent if \
-             the client supplies a progressToken in the request meta."
+            "Whisper large-v3 + ffmpeg video analysis on a dedicated GPU. \
+             DEFAULT to the light path: `transcribe_file` (local, path under DATA_DIR) \
+             or `transcribe_youtube` (URL) return the transcript plus basic info \
+             (duration, resolution, language) and NO images — cheap. Pass \
+             `timestamps:true` for `[MM:SS]` lines that anchor frame windows. \
+             Only when you actually need to SEE the video, load images: `extract_frames` \
+             (page one [start_secs, end_secs] window; near-duplicate frames are dropped \
+             automatically via `dedup`) or `analyze_file`/`analyze_youtube` (transcript + \
+             frames in one shot — best for a SHORT clip). `estimate_video_cost` previews \
+             token cost. Frames are heavy (~1.2k tokens each at medium and they accumulate), \
+             so keep windows lean and prefer scene sampling. For a WHOLE long video, \
+             transcribe once then page successive windows (timestamps stay absolute) rather \
+             than one huge call — a disposable subagent can do the paging in its own context \
+             and report back text. Progress notifications fire if the client sends a progressToken."
                 .into(),
         );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_span_full_when_no_window() {
+        assert_eq!(window_span(None, None, 600.0), 600.0);
+        assert_eq!(window_span(Some(0.0), None, 600.0), 600.0);
+    }
+
+    #[test]
+    fn window_span_uses_bounds() {
+        // Explicit [start, end] → end - start (drives the fallback fps over the
+        // window, not the whole 600s video).
+        assert_eq!(window_span(Some(120.0), Some(180.0), 600.0), 60.0);
+        // Open-ended window → from start to full duration.
+        assert_eq!(window_span(Some(120.0), None, 600.0), 480.0);
+    }
+
+    #[test]
+    fn window_span_ignores_bogus_bounds() {
+        // end <= start or non-finite → treat as open-ended.
+        assert_eq!(window_span(Some(200.0), Some(100.0), 600.0), 400.0);
+        assert_eq!(window_span(None, Some(f64::NAN), 600.0), 600.0);
+    }
+
+    #[test]
+    fn clamp_max_frames_respects_raised_cap() {
+        assert_eq!(clamp_max_frames(0), 1);
+        assert_eq!(clamp_max_frames(10), 10);
+        assert_eq!(clamp_max_frames(60), 60);
+        assert_eq!(clamp_max_frames(1000), MAX_FRAMES_CAP);
+    }
+
+    #[test]
+    fn clamp_uniform_fps_bounds_rate_and_total() {
+        // Absolute rate cap (short window): 600/120 = 5.0 == MAX_UNIFORM_FPS.
+        assert_eq!(clamp_uniform_fps(100_000.0, 120.0), 5.0);
+        // Span cap binds on a long window: 600 frames / 600 s = 1.0 fps ceiling.
+        assert_eq!(clamp_uniform_fps(100_000.0, 600.0), 1.0);
+        // A sane request passes through untouched.
+        assert_eq!(clamp_uniform_fps(0.5, 300.0), 0.5);
+        // Never collapses to zero, even for an absurd span.
+        assert!(clamp_uniform_fps(100_000.0, 1_000_000.0) >= 0.01);
+        // Non-finite span falls back to the absolute cap.
+        assert_eq!(clamp_uniform_fps(100_000.0, f64::NAN), 5.0);
     }
 }
