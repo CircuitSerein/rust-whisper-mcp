@@ -31,6 +31,11 @@ services:
       # Optional blended USD-per-1M-tokens rate for estimate_video_cost. Empty =
       # token counts only, no $ figure (model-agnostic; set to your model's rate).
       TOKEN_COST_USD_PER_MTOK: ${TOKEN_COST_USD_PER_MTOK:-}
+      # Host authorities accepted on /mcp (comma-separated). rmcp 3 validates the
+      # inbound Host header against DNS rebinding; empty = its loopback default,
+      # which already covers localhost:${WHISPER_PORT}. Set this when fronting the
+      # server with a reverse proxy that passes its own Host ("*" disables it).
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-}
       # --- YouTube downloads (yt-dlp) ---
       # PO-token provider. YouTube only serves media URLs to clients that present
       # one; without this every download dies with "HTTP Error 403: Forbidden".

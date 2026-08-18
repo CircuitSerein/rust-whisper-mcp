@@ -13,11 +13,7 @@ categories = ["multimedia::audio", "command-line-utilities"]
 publish = false
 
 [dependencies]
-rmcp = { version = "2", features = [
-    "server",
-    "macros",
-    "transport-streamable-http-server",
-] }
+rmcp = { version = "3", features = ["server", "macros", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 axum = "0.8"
@@ -34,7 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 url = "2"
 uuid = { version = "1", features = ["v4"] }
-base64 = "0.22"
+base64 = "0.23"
 
 [features]
 # GPU build is the default (and what the Docker image uses). CI and CPU-only

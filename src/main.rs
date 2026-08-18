@@ -15,7 +15,7 @@ use axum::{
     Json, Router,
 };
 use rmcp::transport::streamable_http_server::{
-    session::local::LocalSessionManager, tower::StreamableHttpService,
+    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -61,6 +61,28 @@ fn default_true() -> bool {
     true
 }
 
+/// Host authorities the `/mcp` endpoint accepts, from `MCP_ALLOWED_HOSTS`
+/// (comma-separated).
+///
+/// rmcp 3 validates the inbound `Host` header to block DNS-rebinding attacks on
+/// locally running servers, defaulting to loopback only. An entry without a port
+/// matches any port, so the default covers `localhost:17800`. Behind a reverse
+/// proxy that forwards its own `Host`, list that hostname here; `*` disables the
+/// check entirely (only sensible when something in front already validates it).
+fn allowed_hosts(raw: Option<&str>) -> Vec<String> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return StreamableHttpServerConfig::default().allowed_hosts;
+    };
+    if raw == "*" {
+        return Vec::new();
+    }
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -83,11 +105,19 @@ async fn main() -> Result<()> {
     let engine = Arc::new(whisper::Engine::load(&model_path).context("load whisper model")?);
     let server = WhisperServer::new(engine, data_dir.into(), cost_per_mtok);
 
+    // MCP 2026-07-28 is sessionless: rmcp builds a fresh handler per request, so
+    // `WhisperServer` must stay cheap to clone and keep its real state behind
+    // `Arc` (the model, the heavy-work semaphore). The session manager below is
+    // only used by clients that negotiate an older protocol version.
     let mcp_server = server.clone();
+    let mcp_config = StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts(
+        std::env::var("MCP_ALLOWED_HOSTS").ok().as_deref(),
+    ));
+    tracing::info!(allowed_hosts = ?mcp_config.allowed_hosts, "mcp transport configured");
     let mcp_service = StreamableHttpService::new(
         move || Ok(mcp_server.clone()),
         LocalSessionManager::default().into(),
-        Default::default(),
+        mcp_config,
     );
 
     let state = AppState { server };
@@ -237,5 +267,31 @@ impl From<anyhow::Error> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         (self.status, Json(json!({ "error": self.message }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowed_hosts_default_to_loopback_only() {
+        let hosts = allowed_hosts(None);
+        assert!(hosts.contains(&"localhost".to_string()));
+        assert!(hosts.contains(&"127.0.0.1".to_string()));
+        assert_eq!(hosts, allowed_hosts(Some("   ")));
+    }
+
+    #[test]
+    fn allowed_hosts_parses_a_comma_separated_list() {
+        assert_eq!(
+            allowed_hosts(Some("localhost, whisper.internal:8443 ,")),
+            vec!["localhost", "whisper.internal:8443"]
+        );
+    }
+
+    #[test]
+    fn allowed_hosts_star_disables_the_check() {
+        assert!(allowed_hosts(Some("*")).is_empty());
     }
 }

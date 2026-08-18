@@ -9,7 +9,7 @@ Tools: `transcribe_file`, `transcribe_youtube`, `analyze_file`, `analyze_youtube
 
 ## Stack
 
-- Rust + [`rmcp`](https://docs.rs/rmcp) 2.2 — MCP server, Streamable HTTP transport
+- Rust + [`rmcp`](https://docs.rs/rmcp) 3.1 — MCP server, Streamable HTTP transport, protocol `2026-07-28` (sessionless) with legacy sessions still accepted
 - [`whisper-rs`](https://docs.rs/whisper-rs) 0.16 with `cuda` feature — GGML large-v3 on GPU
 - `ffmpeg` (any → 16kHz mono PCM) + `yt-dlp` (YouTube → wav), on a uv-managed Python 3.13
 - [`bgutil-ytdlp-pot-provider`](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) — sidecar that mints the PO tokens YouTube now requires
@@ -267,6 +267,7 @@ scripts/
 - YouTube downloads need the `bgutil-provider` sidecar (compose starts it). YouTube serves media URLs only to clients presenting a PO token; without the provider every download fails with `HTTP Error 403: Forbidden`. `YTDLP_PLAYER_CLIENTS` (default `tv_simply`) picks the client whose formats stay plain-https — set it to `default` to hand the choice back to yt-dlp if YouTube shifts again.
 - Age-restricted / members-only videos need cookies: export a Netscape `cookies.txt` into `WHISPER_DATA_DIR` and set `YTDLP_COOKIES=/data/cookies.txt`.
 - Audio is picked with `-S lang,…`, so the ORIGINAL track wins over YouTube's auto-dubs. Without that, a Russian video can come back transcribed from its English dub.
+- `/mcp` rejects requests whose `Host` header isn't in rmcp's allow-list (loopback by default — a DNS-rebinding guard). Behind a reverse proxy, list its hostname in `MCP_ALLOWED_HOSTS`, or set `*` to switch the check off.
 - Both the `/mcp` Streamable HTTP transport and the `/api/transcribe/*` REST endpoints are **unauthenticated**. The container is published on `127.0.0.1` only (see `docker-compose.yml`), so it is not reachable from the LAN by default — don't switch the host bind to `0.0.0.0` without putting auth / a reverse proxy in front.
 - `transcribe_file`'s path sandbox is **lexical**: it rejects `..` and keeps paths under `DATA_DIR`, but does not resolve symlinks. Treat `DATA_DIR` as a trusted directory.
 - `transcribe_youtube` runs `yt-dlp`, which fetches and executes a remote EJS "n-challenge" solver from GitHub (`--remote-components ejs:github`) via deno. Drop that flag in `media.rs` for a fully offline / locked-down deployment. Only `http`/`https` URLs are accepted.
