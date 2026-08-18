@@ -63,6 +63,84 @@ pub async fn decode_to_pcm(input: &Path) -> Result<Vec<f32>> {
     Ok(samples)
 }
 
+/// Which YouTube player clients yt-dlp asks for formats, unless
+/// `YTDLP_PLAYER_CLIENTS` overrides it.
+///
+/// YouTube hands out playable media URLs only to clients that present a PO
+/// token. The clients yt-dlp reaches without one (`android_vr`) now answer the
+/// media URL with HTTP 403, and the web clients are SABR-only, so their formats
+/// arrive with no URL at all. `tv_simply` is the client whose formats stay
+/// plain-https once a PO token is available — see [`ytdlp_extractor_args`].
+const DEFAULT_PLAYER_CLIENTS: &str = "tv_simply";
+
+/// Format-sort string shared by both download paths. `lang` comes first so the
+/// ORIGINAL audio track wins: YouTube attaches dubbed tracks (fr-FR, pt-BR, …)
+/// to the same video, and sorting by size alone happily picks a dub, which then
+/// gets transcribed as if it were the source language.
+const AUDIO_SORT: &str = "lang,+size,+br";
+
+/// Read an env var, treating unset and blank as the same "not configured".
+fn env_opt(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Build the `--extractor-args` / `--cookies` flags every yt-dlp call shares.
+///
+/// * `clients` — `YTDLP_PLAYER_CLIENTS`; `default` (or empty) leaves yt-dlp's
+///   own client list alone.
+/// * `pot_base_url` — `YTDLP_POT_BASE_URL`, the bgutil PO-token provider
+///   (`brainicism/bgutil-ytdlp-pot-provider`). Without it YouTube downloads fail
+///   with `HTTP Error 403: Forbidden`. Unset leaves the plugin's own default
+///   (`http://127.0.0.1:4416`) in place.
+/// * `cookies` — `YTDLP_COOKIES`, a Netscape cookies file for age-restricted or
+///   members-only videos.
+fn build_extractor_args(
+    clients: Option<&str>,
+    pot_base_url: Option<&str>,
+    cookies: Option<&str>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    let clients = clients.unwrap_or(DEFAULT_PLAYER_CLIENTS);
+    if !clients.is_empty() && clients != "default" {
+        args.push("--extractor-args".to_string());
+        args.push(format!("youtube:player_client={clients}"));
+    }
+    if let Some(base) = pot_base_url {
+        args.push("--extractor-args".to_string());
+        args.push(format!("youtubepot-bgutilhttp:base_url={base}"));
+    }
+    if let Some(path) = cookies {
+        args.push("--cookies".to_string());
+        args.push(path.to_string());
+    }
+    args
+}
+
+/// Env-backed wrapper over [`build_extractor_args`].
+fn ytdlp_extractor_args() -> Vec<String> {
+    build_extractor_args(
+        env_opt("YTDLP_PLAYER_CLIENTS").as_deref(),
+        env_opt("YTDLP_POT_BASE_URL").as_deref(),
+        env_opt("YTDLP_COOKIES").as_deref(),
+    )
+}
+
+/// Trim a yt-dlp stderr dump down to something that fits in an MCP error.
+fn stderr_tail(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let tail: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .rev()
+        .take(3)
+        .collect();
+    tail.into_iter().rev().collect::<Vec<_>>().join("; ")
+}
+
 /// Download a YouTube (or any yt-dlp-supported) URL as the smallest available
 /// audio-only stream, returning the resulting file path inside `dest_dir`.
 ///
@@ -87,7 +165,7 @@ pub async fn download_youtube(url: &str, dest_dir: &Path) -> Result<PathBuf> {
     let out_template = dest_dir.join(format!("{id}.%(ext)s"));
     tracing::info!(url, "yt-dlp download starting");
 
-    let status = Command::new("yt-dlp")
+    let out = Command::new("yt-dlp")
         .args([
             "--no-playlist",
             "--no-progress",
@@ -97,25 +175,31 @@ pub async fn download_youtube(url: &str, dest_dir: &Path) -> Result<PathBuf> {
             // script from GitHub (cached after first run).
             "--remote-components",
             "ejs:github",
-            // Modern format selection: best audio-only stream, sorted to prefer
-            // smallest size / lowest bitrate first. Falls back to "ba" alone if
-            // a source only exposes muxed video+audio.
+            // Modern format selection: best audio-only stream, original language
+            // first, then smallest size / lowest bitrate. Falls back to "ba"
+            // alone if a source only exposes muxed video+audio.
             "-f",
             "ba/bestaudio",
             "-S",
-            "+size,+br",
-            "-o",
+            AUDIO_SORT,
         ])
+        .args(ytdlp_extractor_args())
+        .arg("-o")
         .arg(&out_template)
         .arg(url)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
         .await
         .context("spawn yt-dlp")?;
 
-    if !status.success() {
-        return Err(anyhow!("yt-dlp failed: {status}"));
+    if !out.status.success() {
+        cleanup_prefix(dest_dir, &format!("{id}.")).await;
+        return Err(anyhow!(
+            "yt-dlp failed: {}: {}",
+            out.status,
+            stderr_tail(&out.stderr)
+        ));
     }
 
     // Find the produced file (extension depends on source — m4a/webm/opus/etc.)
@@ -465,6 +549,10 @@ pub async fn download_video(url: &str, dest_dir: &Path) -> Result<PathBuf> {
             // Keep video+audio, cap height so the download stays sane; merge to mp4.
             "-f",
             "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b",
+            // Original audio track first (see AUDIO_SORT) — a dubbed track would
+            // desync the transcript from what the frames show.
+            "-S",
+            "lang",
             "--merge-output-format",
             "mp4",
             "--max-filesize",
@@ -472,8 +560,9 @@ pub async fn download_video(url: &str, dest_dir: &Path) -> Result<PathBuf> {
             // Print the FINAL merged path so we never grab a pre-merge fragment.
             "--print",
             "after_move:filepath",
-            "-o",
         ])
+        .args(ytdlp_extractor_args())
+        .arg("-o")
         .arg(&out_template)
         .arg(url)
         .stdout(Stdio::piped())
@@ -487,7 +576,7 @@ pub async fn download_video(url: &str, dest_dir: &Path) -> Result<PathBuf> {
         return Err(anyhow!(
             "yt-dlp failed: {}: {}",
             out.status,
-            String::from_utf8_lossy(&out.stderr)
+            stderr_tail(&out.stderr)
         ));
     }
 
@@ -657,6 +746,7 @@ pub async fn probe_remote(url: &str) -> Result<VideoMeta> {
     }
     let out = Command::new("yt-dlp")
         .args(["--no-playlist", "--quiet", "--no-warnings", "-j"])
+        .args(ytdlp_extractor_args())
         .arg(url)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -748,6 +838,50 @@ async fn tile_into(frames: &[Frame], cap: u32, dir: &Path) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extractor_args_default_to_the_pot_backed_player_client() {
+        let args = build_extractor_args(None, None, None);
+        assert_eq!(
+            args,
+            vec!["--extractor-args", "youtube:player_client=tv_simply"]
+        );
+    }
+
+    #[test]
+    fn extractor_args_add_pot_provider_and_cookies_when_configured() {
+        let args = build_extractor_args(
+            Some("tv_simply,mweb"),
+            Some("http://bgutil-provider:4416"),
+            Some("/data/cookies.txt"),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--extractor-args",
+                "youtube:player_client=tv_simply,mweb",
+                "--extractor-args",
+                "youtubepot-bgutilhttp:base_url=http://bgutil-provider:4416",
+                "--cookies",
+                "/data/cookies.txt",
+            ]
+        );
+    }
+
+    #[test]
+    fn extractor_args_leave_client_selection_to_ytdlp_on_default_or_blank() {
+        assert!(build_extractor_args(Some("default"), None, None).is_empty());
+        assert!(build_extractor_args(Some(""), None, None).is_empty());
+    }
+
+    #[test]
+    fn stderr_tail_keeps_the_last_three_nonblank_lines() {
+        let raw = b"warn one\n\nwarn two\nwarn three\nERROR: HTTP Error 403: Forbidden\n\n";
+        assert_eq!(
+            stderr_tail(raw),
+            "warn two; warn three; ERROR: HTTP Error 403: Forbidden"
+        );
+    }
 
     #[test]
     fn parses_pts_time_from_metadata_lines() {

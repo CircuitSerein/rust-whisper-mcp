@@ -36,7 +36,9 @@ in the Software without restriction ... (full text at the project repository).
 | Component | License | Notes |
 | --- | --- | --- |
 | [ffmpeg](https://ffmpeg.org/legal.html) 8.1 | **GPL-3.0** | Static [BtbN](https://github.com/BtbN/FFmpeg-Builds) `-gpl` build (not apt). Audio decode + video keyframe extraction (scene/metadata filters, NVDEC). The GPL flavor is deliberate; if you redistribute the image, its GPL terms govern. |
-| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Unlicense | Installed via pip. URL download. |
+| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Unlicense | Installed by `uv` on a managed Python 3.13. URL download. |
+| [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) plugin | **GPL-3.0** | yt-dlp plugin, installed alongside yt-dlp. Fetches the PO tokens YouTube requires. |
+| [uv](https://github.com/astral-sh/uv) + CPython 3.13 | Apache-2.0 / MIT (uv), PSF (CPython) | Installs and hosts yt-dlp inside the image. |
 | [Deno](https://github.com/denoland/deno) | MIT | Installed for yt-dlp's JS challenge solver. |
 | NVIDIA CUDA runtime | NVIDIA proprietary EULA | Base image `nvidia/cuda:*-runtime`. Redistribution governed by NVIDIA's terms. |
 | `ggml-large-v3.bin` model weights | MIT | Downloaded at runtime from HuggingFace `ggerganov/whisper.cpp`. |

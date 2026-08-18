@@ -36,7 +36,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # NOT apt — Ubuntu 22.04 ships ffmpeg 4.4, and we want current scene/metadata
 # filters + -fps_mode + GPU (NVDEC) decode.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl xz-utils python3 python3-pip unzip \
+    ca-certificates curl xz-utils unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Layer 2a: ffmpeg 8.1 (BtbN static, GPL). Tracks the 8.1 release branch (picks up
@@ -52,8 +52,16 @@ RUN curl -fsSL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ff
 # Layer 2b: deno — required by yt-dlp for YouTube JS extraction (independently cacheable)
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 
-# Layer 3: pip packages (independently cacheable)
-RUN pip3 install --no-cache-dir yt-dlp
+# Layer 3: yt-dlp on its own uv-managed Python 3.13 (independently cacheable).
+# NOT apt python3 — Ubuntu 22.04 ships 3.10, which yt-dlp already prints a
+# deprecation banner for. The bgutil plugin ships in the same venv so yt-dlp can
+# fetch PO tokens from the bgutil-provider service; without a token YouTube
+# answers every media URL with HTTP 403 (see docker-compose.yml).
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+RUN curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh \
+ && UV_TOOL_BIN_DIR=/usr/local/bin UV_TOOL_DIR=/opt/uv-tools \
+    uv tool install --python 3.13 yt-dlp --with bgutil-ytdlp-pot-provider \
+ && yt-dlp --version
 
 WORKDIR /app
 COPY --from=builder /app/target/release/rust-whisper-mcp /usr/local/bin/rust-whisper-mcp

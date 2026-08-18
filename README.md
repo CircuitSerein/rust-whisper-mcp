@@ -11,7 +11,8 @@ Tools: `transcribe_file`, `transcribe_youtube`, `analyze_file`, `analyze_youtube
 
 - Rust + [`rmcp`](https://docs.rs/rmcp) 2.2 — MCP server, Streamable HTTP transport
 - [`whisper-rs`](https://docs.rs/whisper-rs) 0.16 with `cuda` feature — GGML large-v3 on GPU
-- `ffmpeg` (any → 16kHz mono PCM) + `yt-dlp` (YouTube → wav)
+- `ffmpeg` (any → 16kHz mono PCM) + `yt-dlp` (YouTube → wav), on a uv-managed Python 3.13
+- [`bgutil-ytdlp-pot-provider`](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) — sidecar that mints the PO tokens YouTube now requires
 - Docker Compose, CUDA 12.4 runtime, single GPU selected by `GPU_INDEX` (default `1`, 0-indexed)
 
 ## Pre-flight (run BEFORE first build)
@@ -220,8 +221,13 @@ Docker Desktop on Windows ignores `device_ids:` in the compose `deploy.resources
 
 ```bash
 # needs: CUDA toolkit, clang, cmake, ffmpeg, yt-dlp on PATH
+#   yt-dlp with the PO-token plugin:
+#   uv tool install yt-dlp --with bgutil-ytdlp-pot-provider
+#   plus the provider itself:
+#   docker run -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider
 export WHISPER_MODEL_PATH=/path/to/ggml-large-v3.bin
 export DATA_DIR=/tmp/whisper-data
+export YTDLP_POT_BASE_URL=http://127.0.0.1:4416
 cargo run --release            # GPU build (cuda feature on by default)
 ```
 
@@ -258,7 +264,9 @@ scripts/
 
 - Single GPU context, serialized — concurrent tool calls queue.
 - Model load is ~5–10s on first call; held in memory for the container's lifetime.
-- yt-dlp may need cookies for age-restricted/private videos — extend `media::download_youtube` with `--cookies-from-browser` or mount a cookies file if needed.
+- YouTube downloads need the `bgutil-provider` sidecar (compose starts it). YouTube serves media URLs only to clients presenting a PO token; without the provider every download fails with `HTTP Error 403: Forbidden`. `YTDLP_PLAYER_CLIENTS` (default `tv_simply`) picks the client whose formats stay plain-https — set it to `default` to hand the choice back to yt-dlp if YouTube shifts again.
+- Age-restricted / members-only videos need cookies: export a Netscape `cookies.txt` into `WHISPER_DATA_DIR` and set `YTDLP_COOKIES=/data/cookies.txt`.
+- Audio is picked with `-S lang,…`, so the ORIGINAL track wins over YouTube's auto-dubs. Without that, a Russian video can come back transcribed from its English dub.
 - Both the `/mcp` Streamable HTTP transport and the `/api/transcribe/*` REST endpoints are **unauthenticated**. The container is published on `127.0.0.1` only (see `docker-compose.yml`), so it is not reachable from the LAN by default — don't switch the host bind to `0.0.0.0` without putting auth / a reverse proxy in front.
 - `transcribe_file`'s path sandbox is **lexical**: it rejects `..` and keeps paths under `DATA_DIR`, but does not resolve symlinks. Treat `DATA_DIR` as a trusted directory.
 - `transcribe_youtube` runs `yt-dlp`, which fetches and executes a remote EJS "n-challenge" solver from GitHub (`--remote-components ejs:github`) via deno. Drop that flag in `media.rs` for a fully offline / locked-down deployment. Only `http`/`https` URLs are accepted.

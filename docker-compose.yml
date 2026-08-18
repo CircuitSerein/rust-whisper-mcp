@@ -31,6 +31,17 @@ services:
       # Optional blended USD-per-1M-tokens rate for estimate_video_cost. Empty =
       # token counts only, no $ figure (model-agnostic; set to your model's rate).
       TOKEN_COST_USD_PER_MTOK: ${TOKEN_COST_USD_PER_MTOK:-}
+      # --- YouTube downloads (yt-dlp) ---
+      # PO-token provider. YouTube only serves media URLs to clients that present
+      # one; without this every download dies with "HTTP Error 403: Forbidden".
+      YTDLP_POT_BASE_URL: ${YTDLP_POT_BASE_URL:-http://bgutil-provider:4416}
+      # Player clients yt-dlp asks for formats. tv_simply is the one whose formats
+      # stay plain-https with a PO token (web clients are SABR-only, android_vr
+      # 403s). Set to "default" to hand client choice back to yt-dlp.
+      YTDLP_PLAYER_CLIENTS: ${YTDLP_PLAYER_CLIENTS:-tv_simply}
+      # Optional Netscape cookies file (inside the container) for age-restricted
+      # or members-only videos, e.g. /data/cookies.txt.
+      YTDLP_COOKIES: ${YTDLP_COOKIES:-}
     volumes:
       # Host directory dropped into the container at /data. Set WHISPER_DATA_DIR
       # in .env (Windows/Docker Desktop wants forward slashes, e.g. D:/whisper-data).
@@ -43,12 +54,23 @@ services:
             - driver: nvidia
               device_ids: ["${GPU_INDEX:-1}"]   # 0-indexed; matches CUDA_VISIBLE_DEVICES
               capabilities: [gpu]
+    depends_on:
+      - bgutil-provider
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 60s
+
+  # PO-token provider for yt-dlp (github.com/Brainicism/bgutil-ytdlp-pot-provider).
+  # Small node service; reachable only over the compose network, no published port.
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: bgutil-provider
+    restart: unless-stopped
+    expose:
+      - "4416"
 
 volumes:
   whisper-models:
